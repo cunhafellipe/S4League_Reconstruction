@@ -1,0 +1,5 @@
+[
+    { "scn": "sword.scn", "states": "PlasmaSword" },
+    { "scn": "spydagger_joker.scn",                  "states": "SpyDagger" },
+    { "scn": "counter_crow_l.scn",              "states": "CounterSword" }
+]

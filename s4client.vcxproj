@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5F4C0A11-0001-4A21-9C10-000000000001}</ProjectGuid>
+    <RootNamespace>s4client</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>S4Client</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization Condition="'$(Configuration)'=='Debug'">Disabled</Optimization>
+      <AdditionalIncludeDirectories>$(SolutionDir)src;$(SolutionDir)third_party\lua-5.1.5\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>winmm.lib;xaudio2.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\app\winmain.cpp" />
+    <ClCompile Include="src\audio\audio.cpp" />
+    <ClCompile Include="src\render\renderer.cpp" />
+    <ClCompile Include="src\newrender\renderer_d3d11.cpp" />
+    <ClCompile Include="src\world\world.cpp" />
+    <ClCompile Include="src\world\movement.cpp" />
+    <ClCompile Include="src\scenes\scenes.cpp" />
+    <ClCompile Include="src\anim\anim_controller.cpp" />
+    <ClCompile Include="src\anim\actorstates.cpp" />
+    <ClInclude Include="src\anim\anim_controller.h" />
+    <ClInclude Include="src\anim\anim_states.h" />
+    <ClInclude Include="src\anim\actorstates.h" />
+    <ClInclude Include="src\audio\audio.h" />
+    <ClInclude Include="src\world\movement.h" />
+    <ClCompile Include="src\net\proud_frame.cpp" />
+    <ClCompile Include="src\net\proud_client.cpp" />
+    <ClCompile Include="src\net\proud_crypt.cpp" />
+    <ClCompile Include="src\net\config.cpp" />
+    <ClInclude Include="src\net\config.h" />
+    <ClCompile Include="src\scn\scn.cpp" />
+    <ClInclude Include="src\scn\scn.h" />
+    <ClCompile Include="src\scn\skin.cpp" />
+    <ClInclude Include="src\scn\skin.h" />
+    <ClCompile Include="src\scn\character.cpp" />
+    <ClInclude Include="src\scn\character.h" />
+    <ClCompile Include="src\data\item_db.cpp" />
+    <ClInclude Include="src\data\item_db.h" />
+    <ClCompile Include="src\data\weapon_attach.cpp" />
+    <ClInclude Include="src\data\weapon_attach.h" />
+    <ClCompile Include="src\seq\seq.cpp" />
+    <ClInclude Include="src\seq\seq.h" />
+    <ClCompile Include="src\seq\seq_player.cpp" />
+    <ClInclude Include="src\seq\seq_player.h" />
+    <ClCompile Include="src\lua\lua_weapon_fire.cpp" />
+    <ClInclude Include="src\lua\lua_weapon_fire.h" />
+    <ClCompile Include="src\gui\xui.cpp" />
+    <ClCompile Include="src\gui\gui_render.cpp" />
+    <ClInclude Include="src\net\proud_crypt.h" />
+    <ClInclude Include="src\gui\xui.h" />
+    <ClInclude Include="src\gui\gui_render.h" />
+    <ClInclude Include="src\net\proud_frame.h" />
+    <ClInclude Include="src\net\proud_client.h" />
+    <ClInclude Include="src\net\proud_opcodes.h" />
+    <ClInclude Include="src\scenes\scenes.h" />
+    <ClInclude Include="src\render\irenderer.h" />
+    <ClInclude Include="src\render\renderer.h" />
+    <ClInclude Include="src\newrender\renderer_d3d11.h" />
+    <ClInclude Include="src\world\world.h" />
+    <ClInclude Include="src\world\scene.h" />
+  </ItemGroup>
+  <ItemGroup Label="Lua 5.1.5 (embedded interpreter for lua_weapon_fire - runs the real Weapon_*.lua scripts)">
+    <ClCompile Include="third_party\lua-5.1.5\src\lapi.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lauxlib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lbaselib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lcode.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\ldblib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\ldebug.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\ldo.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\ldump.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lfunc.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lgc.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\linit.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\liolib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\llex.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lmathlib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lmem.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\loadlib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lobject.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lopcodes.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\loslib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lparser.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lstate.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lstring.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lstrlib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\ltable.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\ltablib.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\ltm.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lundump.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lvm.c" />
+    <ClCompile Include="third_party\lua-5.1.5\src\lzio.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="third_party\lua_weapon_shim.lua">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>third_party\lua_weapon_shim.lua</Link>
+    </None>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
