@@ -27,6 +27,10 @@ static std::string LocalPath(std::string path) {
     std::replace(path.begin(), path.end(), '\\', '/');
     if (path.rfind("Resources/", 0) == 0 || path.rfind("resources/", 0) == 0)
         path = "resources/" + path;
+    // Some data drops the "Resources/" prefix (bginfo [BGM] "Bgm/battle1.ogg",
+    // weapon Lua "Sound/..."): those live under resources/resources/ too.
+    else if (path.find(':') == std::string::npos && path.rfind("/", 0) != 0)
+        path = "resources/resources/" + path;
     return path;
 }
 

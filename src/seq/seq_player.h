@@ -16,11 +16,15 @@ struct Particle {
     float x = 0, y = 0, z = 0;
     float r = 1, g = 1, b = 1, a = 1;
     float size = 1;
+    float sizeX = 1, sizeY = 1;   // keyframe width / height (streaks: 5 x 300)
+    float vx = 0, vy = 0, vz = 0; // velocity, emitter space (renderType 1 stretches along it)
+    float rotate = 0;             // keyframe rotation, degrees (in the quad's own plane)
+    float age = 0;                // ms since this particle was born
+    int   frame = 0;              // index into the node's texture list (texture animation)
 };
 
 // Linear interpolation between the two keyframes bracketing u (0..1 over the
-// particle's own lifetime). u is remapped into the keys' own frame range
-// first, since keyframe "frame" values aren't guaranteed to span 0..1.
+// particle's own lifetime). S10 compares age/lifetime directly to key.frame.
 Key SampleKeys(const std::vector<Key>& keys, float u);
 
 class ParticlePlayer {
@@ -35,6 +39,8 @@ public:
     // Additive blending (fire/glow/energy effects) vs normal alpha (smoke,
     // dust) - comes straight from the node's own blendType field.
     bool additive() const { return additive_; }
+    uint32_t renderType() const { return renderType_; }
+    bool attachTarget() const { return attachTarget_; }
 
     // Total span this system stays active for, in ms (0 = runs forever /
     // caller decides when to stop it).
@@ -52,7 +58,18 @@ private:
     uint32_t beginTime_ = 0, endTime_ = 0;
     float lifetime_ = 1.f, interval_ = 1.f, cycle_ = 1.f, scale_ = 1.f;
     int count_ = 0;
+    // Emitter key Continuance = 0 (S10 CParticleSystem FUN_01c8adb0, key
+    // +0x10): EmitPerSec particles come out ONCE, all together, then the
+    // emitter stops (+0x38). Only Continuance = 1 emits per second.
+    bool burst_ = false;
+    uint32_t renderType_ = 0;
+    uint32_t texAnimType_ = 0, texAnimDelay_ = 0;
+    int texCount_ = 1;
+    bool attachTarget_ = false;
     bool additive_ = false;
+    std::vector<float> lifetimes_, speeds_;
+    std::vector<int> textureStarts_;
+    std::vector<std::vector<Key>> particleKeys_;
     std::vector<float> dirX_, dirY_, dirZ_;
     std::vector<float> spawnX_, spawnY_, spawnZ_;
 };

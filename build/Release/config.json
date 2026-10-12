@@ -1,0 +1,11 @@
+{
+    "weapons": [
+        { "scn": "sword.scn", "states": "PlasmaSword" }
+    ],
+    "online": { "enabled": false, "server": "127.0.0.1", "port": 4100, "nickname": "player" },
+    "resource_mode": "normal",
+    "graphics_quality": "high",
+    "resolution": "1600x900",
+    "display": "windowed",
+    "aspect": "auto"
+}

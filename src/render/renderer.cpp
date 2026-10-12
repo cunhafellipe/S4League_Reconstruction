@@ -54,6 +54,17 @@ static void BuildPresentParams(const CRendererD3D& r, D3DPRESENT_PARAMETERS& pp)
     pp.FullScreen_RefreshRateInHz = r.fullscreen ? r.refresh : 0;
     pp.PresentationInterval   = r.vsync ? D3DPRESENT_INTERVAL_ONE
                                         : D3DPRESENT_INTERVAL_IMMEDIATE; // 1 / 0x80000000
+    // High quality: 4x MSAA when the card supports it with this back/depth
+    // buffer (DISCARD swap only).
+    if (r.quality >= 2 && r.d3d && !r.swapCopy && !r.fullscreen) {
+        D3DDISPLAYMODE dm = {};
+        if (SUCCEEDED(r.d3d->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &dm)) &&
+            SUCCEEDED(r.d3d->CheckDeviceMultiSampleType(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dm.Format, TRUE, D3DMULTISAMPLE_4_SAMPLES, nullptr)) &&
+            SUCCEEDED(r.d3d->CheckDeviceMultiSampleType(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, D3DFMT_D24X8, TRUE, D3DMULTISAMPLE_4_SAMPLES, nullptr))) {
+            pp.MultiSampleType = D3DMULTISAMPLE_4_SAMPLES;
+            pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        }
+    }
     // ponytail: fullscreen backbuffer format + ChangeDisplaySettings mode set
     // deferred until fullscreen is exercised.
 }
@@ -94,9 +105,50 @@ bool CRendererD3D::CanRender()
     return device->TestCooperativeLevel() == D3D_OK;
 }
 
+// Rebuilds the swap chain for the current width/height/quality. Textures come
+// from D3DXCreateTextureFromFile (MANAGED pool) and survive; the D3DX fonts
+// hold device objects and are recreated on demand.
+bool CRendererD3D::ResetDevice() {
+    if (!device) return false;
+    for (auto& kv : fonts) if (kv.second) reinterpret_cast<IUnknown*>(kv.second)->Release();   // ID3DXFont is only forward-declared here
+    fonts.clear();
+    D3DPRESENT_PARAMETERS pp;
+    BuildPresentParams(*this, pp);
+    const HRESULT hr = device->Reset(&pp);
+    DbgLog("[renderer] Reset %dx%d quality=%d msaa=%d -> hr=0x%08lx", width, height, quality, (int)pp.MultiSampleType, (unsigned long)hr);
+    if (SUCCEEDED(hr)) device->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, pp.MultiSampleType != D3DMULTISAMPLE_NONE);
+    return SUCCEEDED(hr);
+}
+
+void CRendererD3D::ApplyMeshSampler(unsigned stage) {
+    if (!device) return;
+    D3DCAPS9 caps = {};
+    device->GetDeviceCaps(&caps);
+    if (quality >= 2 && (caps.TextureFilterCaps & D3DPTFILTERCAPS_MINFANISOTROPIC) && caps.MaxAnisotropy > 1) {
+        device->SetSamplerState(stage, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+        device->SetSamplerState(stage, D3DSAMP_MAXANISOTROPY, (std::min)(8ul, (unsigned long)caps.MaxAnisotropy));
+    } else {
+        device->SetSamplerState(stage, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    }
+    device->SetSamplerState(stage, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(stage, D3DSAMP_MIPFILTER, quality >= 1 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
+}
+
 void CRendererD3D::BeginFrame()
 {
     if (!device) return;
+    bool reset = false;
+    if (pendingW > 0 && pendingH > 0 && (pendingW != width || pendingH != height)) {
+        width = pendingW; height = pendingH; vpW = vpH = 0; reset = true;
+    }
+    pendingW = pendingH = 0;
+    if (pendingQuality >= 0 && pendingQuality != quality) {
+        const bool msaaChange = (pendingQuality >= 2) != (quality >= 2);
+        quality = pendingQuality;
+        reset = reset || msaaChange;
+    }
+    pendingQuality = -1;
+    if (reset) ResetDevice();
     device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
                   D3DCOLOR_XRGB(20, 24, 32), 1.0f, 0);
     device->BeginScene();
@@ -248,7 +300,7 @@ void CRendererD3D::SetCamera3D(const float eye[3], const float at[3],
 
 // Camera-facing quads (2 tris each), colored per particle, no depth write so
 // overlapping effects don't fight each other for draw order.
-void CRendererD3D::DrawParticles(const float* particles, int count, int tex, bool additive) {
+void CRendererD3D::DrawParticles(const float* particles, int count, int tex, bool additive, int renderType, const float* uv) {
     if (!device || count <= 0) return;
 
     float fwd[3] = { camAt[0]-camEye[0], camAt[1]-camEye[1], camAt[2]-camEye[2] };
@@ -265,19 +317,83 @@ void CRendererD3D::DrawParticles(const float* particles, int count, int tex, boo
     std::vector<PV> v((size_t)count * 4);
     std::vector<unsigned short> idx((size_t)count * 6);
     for (int i = 0; i < count; ++i) {
-        const float* p = particles + i*8;
-        float hs = p[7] * 0.5f;
-        DWORD color = D3DCOLOR_COLORVALUE(p[3], p[4], p[5], p[6]);
+        const float* p = particles + i*12;
+        const float hw = p[7] * 0.5f, hh = p[8] * 0.5f;
+        // Axes of this quad: camera right/up, or for a streak the velocity
+        // projected on the view plane (long side) and its perpendicular.
+        float ax[3] = { right[0], right[1], right[2] }, ay[3] = { up[0], up[1], up[2] };
+        float hhLocal = hh;
+        float hwLocal = hw;
+        if (renderType >= 10) {
+            // S10 sub_1C8D470 builds corners directly at +/- sizeX,sizeY.
+            // S10 sub_1C8D470 puts the corners at +-key size, but on screen the
+            // client's effects measure half that (side-by-side with the
+            // original: smash rail right at half, revolver flash and wall hit
+            // double at full) - a scale somewhere in the effect node chain not
+            // found yet. Half extents = key size / 2 until that is located.
+            hwLocal = p[7] * 0.5f; hhLocal = p[8] * 0.5f;
+            const int t = renderType - 10;
+            float bx[3], by[3];   // the quad's plane before its own rotation
+            if (t == 1) {
+                const float vl = std::sqrt(p[9]*p[9] + p[10]*p[10] + p[11]*p[11]);
+                if (vl > 1e-3f) {
+                    ay[0] = p[9]/vl; ay[1] = p[10]/vl; ay[2] = p[11]/vl;
+                    // Across = view direction x velocity (client: cross with the eye ray).
+                    const float e[3] = { p[0]-camEye[0], p[1]-camEye[1], p[2]-camEye[2] };
+                    float cx[3] = { e[1]*ay[2]-e[2]*ay[1], e[2]*ay[0]-e[0]*ay[2], e[0]*ay[1]-e[1]*ay[0] };
+                    const float cl = std::sqrt(cx[0]*cx[0] + cx[1]*cx[1] + cx[2]*cx[2]);
+                    if (cl > 1e-5f) { ax[0] = cx[0]/cl; ax[1] = cx[1]/cl; ax[2] = cx[2]/cl; }
+                }
+            } else {
+                if (t == 2) {          // upright, facing the camera horizontally
+                    float hx = right[0], hz = right[2]; const float hl = std::sqrt(hx*hx + hz*hz);
+                    if (hl > 1e-5f) { hx /= hl; hz /= hl; } else { hx = 1.f; hz = 0.f; }
+                    bx[0] = hx; bx[1] = 0.f; bx[2] = hz; by[0] = 0.f; by[1] = 1.f; by[2] = 0.f;
+                } else if (t == 3) {   // flat on the ground
+                    bx[0] = 1.f; bx[1] = 0.f; bx[2] = 0.f; by[0] = 0.f; by[1] = 0.f; by[2] = 1.f;
+                } else {               // camera-facing
+                    std::memcpy(bx, right, sizeof(bx)); std::memcpy(by, up, sizeof(by));
+                }
+                const float rr = p[9] * 3.14159265f / 180.f, cr = std::cos(rr), sr = std::sin(rr);
+                for (int k = 0; k < 3; ++k) { ax[k] = bx[k]*cr + by[k]*sr; ay[k] = -bx[k]*sr + by[k]*cr; }
+            }
+        }
+        if (renderType == 2) {
+            // True 3D segment: long side exactly along p[9..11] (full length),
+            // short side facing the camera - perspective foreshortens it.
+            const float sv[3] = { p[9], p[10], p[11] };
+            const float sl = std::sqrt(sv[0]*sv[0] + sv[1]*sv[1] + sv[2]*sv[2]);
+            if (sl > 1e-3f) {
+                ay[0] = sv[0]/sl; ay[1] = sv[1]/sl; ay[2] = sv[2]/sl;
+                float cx[3] = { fwd[1]*ay[2]-fwd[2]*ay[1], fwd[2]*ay[0]-fwd[0]*ay[2], fwd[0]*ay[1]-fwd[1]*ay[0] };
+                const float cl = std::sqrt(cx[0]*cx[0] + cx[1]*cx[1] + cx[2]*cx[2]);
+                if (cl > 1e-5f) { ax[0] = cx[0]/cl; ax[1] = cx[1]/cl; ax[2] = cx[2]/cl; }
+                hhLocal = sl * 0.5f;
+            }
+        }
+        if (renderType == 1) {
+            float v[3] = { p[9], p[10], p[11] };
+            const float vf = v[0]*fwd[0] + v[1]*fwd[1] + v[2]*fwd[2];
+            v[0] -= fwd[0]*vf; v[1] -= fwd[1]*vf; v[2] -= fwd[2]*vf;
+            const float vl = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            if (vl > 1e-3f) {
+                ay[0] = v[0]/vl; ay[1] = v[1]/vl; ay[2] = v[2]/vl;
+                ax[0] = fwd[1]*ay[2] - fwd[2]*ay[1]; ax[1] = fwd[2]*ay[0] - fwd[0]*ay[2]; ax[2] = fwd[0]*ay[1] - fwd[1]*ay[0];
+            }
+        }
+        auto c01 = [](float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); };
+        DWORD color = D3DCOLOR_COLORVALUE(c01(p[3]), c01(p[4]), c01(p[5]), c01(p[6]));
         PV* q = &v[i*4];
         for (int c = 0; c < 4; ++c) {
-            float sx = (c==0||c==3) ? -hs : hs;
-            float sy = (c==0||c==1) ? -hs : hs;
-            q[c].x = p[0] + right[0]*sx + up[0]*sy;
-            q[c].y = p[1] + right[1]*sx + up[1]*sy;
-            q[c].z = p[2] + right[2]*sx + up[2]*sy;
+            float sx = (c==0||c==3) ? -hwLocal : hwLocal;
+            float sy = (c==0||c==1) ? -hhLocal : hhLocal;
+            q[c].x = p[0] + ax[0]*sx + ay[0]*sy;
+            q[c].y = p[1] + ax[1]*sx + ay[1]*sy;
+            q[c].z = p[2] + ax[2]*sx + ay[2]*sy;
             q[c].color = color;
-            q[c].u = sx > 0 ? 1.f : 0.f;
-            q[c].v = sy > 0 ? 0.f : 1.f;
+            static const int uvCorner[4] = { 1, 3, 2, 0 }; // BL, BR, TR, TL
+            q[c].u = uv ? uv[uvCorner[c]*2] : ((c==1||c==2) ? 1.f : 0.f);
+            q[c].v = uv ? uv[uvCorner[c]*2+1] : ((c==0||c==1) ? 1.f : 0.f);
         }
         unsigned short base = (unsigned short)(i*4);
         unsigned short* qi = &idx[i*6];
@@ -324,6 +440,61 @@ void CRendererD3D::DrawParticles(const float* particles, int count, int tex, boo
     device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
 }
 
+void CRendererD3D::DrawBeam(const float* pts, int count, float width, uint32_t argb, int tex, bool additive, float u0, float u1) {
+    if (!device || count < 2) return;
+    struct PV { float x,y,z; DWORD color; float u,v; };
+    std::vector<PV> v((size_t)count * 2);
+    float total = 0.f;
+    for (int i = 1; i < count; ++i) {
+        const float* a = pts + (i-1)*3; const float* b = pts + i*3;
+        total += std::sqrt((b[0]-a[0])*(b[0]-a[0]) + (b[1]-a[1])*(b[1]-a[1]) + (b[2]-a[2])*(b[2]-a[2]));
+    }
+    if (total < 1e-3f) return;
+    float run = 0.f;
+    for (int i = 0; i < count; ++i) {
+        const float* p = pts + i*3;
+        const float* a = pts + (i > 0 ? i-1 : i)*3; const float* b = pts + (i < count-1 ? i+1 : i)*3;
+        float t[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] };
+        // Across = tangent x (point -> eye): the ribbon always faces the camera.
+        const float e[3] = { camEye[0]-p[0], camEye[1]-p[1], camEye[2]-p[2] };
+        float s[3] = { t[1]*e[2]-t[2]*e[1], t[2]*e[0]-t[0]*e[2], t[0]*e[1]-t[1]*e[0] };
+        const float sl = std::sqrt(s[0]*s[0] + s[1]*s[1] + s[2]*s[2]);
+        if (sl > 1e-5f) { s[0] /= sl; s[1] /= sl; s[2] /= sl; } else { s[0] = 0; s[1] = 1; s[2] = 0; }
+        if (i > 0) { const float* q = pts + (i-1)*3; run += std::sqrt((p[0]-q[0])*(p[0]-q[0]) + (p[1]-q[1])*(p[1]-q[1]) + (p[2]-q[2])*(p[2]-q[2])); }
+        const float u = u0 + (u1 - u0) * (run / total), hw = width * 0.5f;
+        v[i*2]   = { p[0] - s[0]*hw, p[1] - s[1]*hw, p[2] - s[2]*hw, (DWORD)argb, u, 1.f };
+        v[i*2+1] = { p[0] + s[0]*hw, p[1] + s[1]*hw, p[2] + s[2]*hw, (DWORD)argb, u, 0.f };
+    }
+    D3DMATRIX ident = {}; ident._11=ident._22=ident._33=ident._44=1.0f;
+    device->SetTransform(D3DTS_WORLD, &ident);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, additive ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
+    const bool textured = (tex >= 0 && tex < (int)textures.size());
+    device->SetTexture(0, textured ? textures[tex] : nullptr);
+    device->SetTextureStageState(0, D3DTSS_COLOROP, textured ? D3DTOP_MODULATE : D3DTOP_SELECTARG2);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, textured ? D3DTOP_MODULATE : D3DTOP_SELECTARG2);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, count*2 - 2, v.data(), sizeof(PV));
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
+}
+
 // Textured 3D mesh (a .scn model). Uses the depth buffer; leaves Z disabled on
 // exit so the 2D bg/text draws that follow are unaffected.
 void CRendererD3D::DrawMesh(const float* posUV, int vc,
@@ -342,8 +513,11 @@ void CRendererD3D::DrawMesh(const float* posUV, int vc,
 
     // Per-mesh state from the .scn RenderFlag (io_s4league_scn): 2=TRANSPARENT
     // (alpha blend), 4=CUTOUT (alpha test, opaque), 8=NO_CULLING, 64=NO_DEPTH_WRITE.
-    const bool transparent = (flags & 2) != 0;
-    const bool cutout      = (flags & 4) != 0;
+    // 32 = FLARE and 0x40000000 (set by the caller from an "alphablend2" name
+    // tag) are ADDITIVE: glow/energy meshes add light instead of covering.
+    const bool additiveMesh = (flags & 32) != 0 || (flags & 0x40000000u) != 0;
+    const bool transparent = (flags & 2) != 0 || additiveMesh;
+    const bool cutout      = (flags & 4) != 0 && !additiveMesh;
     const bool noZWrite    = (flags & 64) != 0;
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);      // winding unconfirmed -> no cull
     device->SetRenderState(D3DRS_LIGHTING, FALSE);             // unlit textured (S4 characters)
@@ -355,7 +529,7 @@ void CRendererD3D::DrawMesh(const float* posUV, int vc,
         // sorting gaps. Transparent: alpha BLEND, no Z-write. Else opaque.
         device->SetRenderState(D3DRS_ALPHABLENDENABLE, transparent ? TRUE : FALSE);
         device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_DESTBLEND, additiveMesh ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
         device->SetRenderState(D3DRS_ALPHATESTENABLE, (cutout || transparent) ? TRUE : FALSE);
         device->SetRenderState(D3DRS_ALPHAREF, cutout ? 128 : 8);   // hair needs a firm cutoff
         device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
@@ -363,15 +537,28 @@ void CRendererD3D::DrawMesh(const float* posUV, int vc,
         device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
         device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
         device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        if (meshFade < 0.999f) {
+            // Fading effect mesh: texture x fade (colour too, for additive glow).
+            const DWORD f = (DWORD)((meshFade < 0.f ? 0.f : meshFade) * 255.f);
+            device->SetRenderState(D3DRS_TEXTUREFACTOR, (f << 24) | (f << 16) | (f << 8) | f);
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            // Once, not twice: additive glow fades its colour (alpha stays the
+            // texture's), alpha-blended meshes fade their alpha. Modulating
+            // both turned a 0.7 opacity key into 0.49.
+            device->SetTextureStageState(0, D3DTSS_COLOROP, additiveMesh ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, additiveMesh ? D3DTOP_SELECTARG1 : D3DTOP_MODULATE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+        }
+        ApplyMeshSampler(0);   // quality: trilinear / anisotropic
         device->SetTexture(0, textures[tex]);
     } else {
         // No texture -> flat color so the geometry (skinning) is visible.
         device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
         device->SetTexture(0, nullptr);
-        device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFB0A0E0);   // light violet
+        device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFFFFFF);   // missing texture -> plain white
         device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
         device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
         device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
@@ -382,6 +569,8 @@ void CRendererD3D::DrawMesh(const float* posUV, int vc,
                                    idx, D3DFMT_INDEX16, v.data(), sizeof(V3T));
     device->SetRenderState(D3DRS_ZENABLE, FALSE);             // restore 2D-friendly state
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
 }
 
 void CRendererD3D::DrawMeshLightmap(const float* posUV2, int vc,
@@ -430,8 +619,8 @@ void CRendererD3D::DrawMeshLightmap(const float* posUV2, int vc,
     device->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_CURRENT);
     device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
     device->SetTextureStageState(1, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
-    device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-    device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    ApplyMeshSampler(0);
+    ApplyMeshSampler(1);
 
     device->SetFVF(D3DFVF_XYZ | D3DFVF_TEX2);
     device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vc, ic / 3,
@@ -450,6 +639,11 @@ void CRendererD3D::SetViewport(int x, int y, int w, int h) {
     else { vpW = w; vpH = h; }
     D3DVIEWPORT9 vp = { (DWORD)x, (DWORD)y, (DWORD)w, (DWORD)h, 0.0f, 1.0f };
     device->SetViewport(&vp);
+}
+
+void CRendererD3D::ClearViewport(uint32_t argb) {
+    if (!device) return;
+    device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, (D3DCOLOR)argb, 1.0f, 0);   // viewport-clipped
 }
 
 void CRendererD3D::Shutdown()
@@ -474,7 +668,20 @@ void CRendererD3D::DrawRect(int x, int y, int w, int h, uint32_t argb)
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     device->SetRenderState(D3DRS_LIGHTING, FALSE);
     device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    // Own color/alpha source: the vertex color. A mesh drawn before (an
+    // untextured piece selects the texture factor) left stage 0 reading
+    // TFACTOR, so every UI rect came out in that color (white panels).
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     device->SetTexture(0, nullptr);
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+    device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
     device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(TL));
 }
@@ -510,12 +717,28 @@ int CRendererD3D::ResolveAndLoad(const std::string& name) {
 
     // A name with a path separator is a .scn-relative texture: load it directly
     // (the client resolves textures relative to the model's own folder, so the
-    // right variant wins over same-named files elsewhere). .tga -> .dds fallback.
+    // right variant wins over same-named files elsewhere). Any image format:
+    // the name as written first, then the same name in every other format
+    // (.dds .tga .png .jpg .jpeg .bmp) - the .scn names the source image and
+    // the tree may ship another (127_male_body asks for _atex.png, only the
+    // .dds exists).
+    static const char* kImageExts[] = { ".dds", ".tga", ".png", ".jpg", ".jpeg", ".bmp" };
+    auto variants = [](const std::string& n) {
+        std::vector<std::string> out{ n };
+        const size_t dot = n.find_last_of('.');
+        const size_t sep = n.find_last_of("/\\");
+        if (dot == std::string::npos || (sep != std::string::npos && dot < sep)) return out;
+        std::string ext = n.substr(dot);
+        for (auto& c : ext) c = (char)tolower(c);
+        bool isImage = false;
+        for (const char* e : kImageExts) if (ext == e) isImage = true;
+        if (!isImage) return out;
+        for (const char* e : kImageExts) if (ext != e) out.push_back(n.substr(0, dot) + e);
+        return out;
+    };
     if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos) {
-        std::string paths[2] = { name, name };
-        if (name.size() > 4 && (name.compare(name.size()-4,4,".tga")==0 || name.compare(name.size()-4,4,".TGA")==0))
-            paths[1] = name.substr(0, name.size()-4) + ".dds";
-        for (const std::string& p : paths) {
+        for (const std::string& p : variants(name)) {
+            if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
             IDirect3DTexture9* dt = nullptr;
             if (SUCCEEDED(g_createTex(device, p.c_str(), &dt)) && dt) {
                 D3DSURFACE_DESC d = {}; dt->GetLevelDesc(0, &d);
@@ -528,11 +751,10 @@ int CRendererD3D::ResolveAndLoad(const std::string& name) {
 
     std::string key = name;
     for (auto& c : key) c = (char)tolower(c);
-    auto f = fileIndex.find(key);
-    // Source data names textures .tga or .bmp; both ship as .dds in the actual tree.
-    if (f == fileIndex.end() && key.size() > 4 &&
-        (key.compare(key.size() - 4, 4, ".tga") == 0 || key.compare(key.size() - 4, 4, ".bmp") == 0))
-        f = fileIndex.find(key.substr(0, key.size() - 4) + ".dds");
+    // Same name in any image format (source data names .tga/.bmp/.png, the
+    // tree may ship .dds or another one).
+    auto f = fileIndex.end();
+    for (const std::string& v : variants(key)) { f = fileIndex.find(v); if (f != fileIndex.end()) break; }
     if (f == fileIndex.end()) return -1;
     if (name.find("login_bg") != std::string::npos || name.find("logo_back") != std::string::npos)
         DbgLog("[tex] resolve '%s' -> %s", name.c_str(), f->second.c_str());

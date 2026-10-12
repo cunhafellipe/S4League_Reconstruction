@@ -40,7 +40,14 @@ struct CRendererD3D : IRenderer {
                           const unsigned short* idx, int idxCount,
                           int tex, int lmTex, const float* world16, uint32_t flags = 0) override;
     void SetViewport(int x, int y, int w, int h) override;   // (0,0,0,0) = full backbuffer
-    void DrawParticles(const float* particles, int count, int tex, bool additive) override;
+    void RequestResize(int w, int h) override { pendingW = w; pendingH = h; }
+    void RequestQuality(int q) override { pendingQuality = q; }
+    int  pendingW = 0, pendingH = 0, pendingQuality = -1;
+    bool ResetDevice();                 // rebuild the swap chain (size / MSAA)
+    void ApplyMeshSampler(unsigned stage);
+    void ClearViewport(uint32_t argb) override;
+    void DrawParticles(const float* particles, int count, int tex, bool additive, int renderType, const float* uv = nullptr) override;
+    void DrawBeam(const float* pts, int count, float width, uint32_t argb, int tex, bool additive, float u0, float u1) override;
 
 private:
     float camEye[3] = {0,0,0}, camAt[3] = {0,0,1};   // cached from the last SetCamera3D, for particle billboards

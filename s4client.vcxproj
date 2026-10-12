@@ -39,6 +39,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalDependencies>winmm.lib;xaudio2.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -51,6 +52,10 @@
     <ClCompile Include="src\scenes\scenes.cpp" />
     <ClCompile Include="src\anim\anim_controller.cpp" />
     <ClCompile Include="src\anim\actorstates.cpp" />
+    <ClCompile Include="src\game\actor_input.cpp" />
+    <ClCompile Include="src\game\actor_fsm.cpp" />
+    <ClInclude Include="src\game\actor_input.h" />
+    <ClInclude Include="src\game\actor_fsm.h" />
     <ClInclude Include="src\anim\anim_controller.h" />
     <ClInclude Include="src\anim\anim_states.h" />
     <ClInclude Include="src\anim\actorstates.h" />
@@ -60,6 +65,7 @@
     <ClCompile Include="src\net\proud_client.cpp" />
     <ClCompile Include="src\net\proud_crypt.cpp" />
     <ClCompile Include="src\net\config.cpp" />
+    <ClCompile Include="src\net\mp_client.cpp" />
     <ClInclude Include="src\net\config.h" />
     <ClCompile Include="src\scn\scn.cpp" />
     <ClInclude Include="src\scn\scn.h" />

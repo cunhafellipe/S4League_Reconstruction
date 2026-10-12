@@ -43,6 +43,16 @@ struct Node {
     bool     isParticle = false;   // CActParticle(_IF): the rest of the fields below are valid
     uint32_t beginTime = 0, endTime = 0;
     uint32_t renderType = 0, textureAnimType = 0, blendType = 0;   // blendType 1 = additive
+    // CParticleData+0x54 "AttachTarget". S10 CParticleSystem update
+    // (sub_1C8ADB0): while it is 0 every live particle's anchor is reset to
+    // the emitter each step (the spray moves with the actor); 1 leaves each
+    // particle where it was born (trails stay in the world).
+    bool     attachTarget = false;
+    uint32_t textureAnimDelay = 0;   // ms per frame for textureAnimType 2/3
+    uint32_t lifetimeVar = 0, maxParticles = 600;
+    float emitterSpeedVar = 0, sizeVar = 0, sizeXVar = 0, sizeYVar = 0;
+    float colorVar[3] = {}, alphaVar = 0, rotateVar = 0;
+    bool sizeLock = false, colorLock = false, alphaLock = false, rotateLock = false;
     std::vector<Emitter> emitters;   // real files: 0 or 1
     std::vector<Key>     keys;
     std::vector<TexRef>  textures;
@@ -54,6 +64,31 @@ struct Node {
     // but every real file carries the model path as a plain string somewhere
     // in the body.
     std::string modelFile;
+    // CActNodeLoader 0.3 (S1 writer sub_540300): FileName, AnimName, Loop,
+    // FadeInTime, FadeOutTime, TexAnimNode, TexAnimType, TexAnimDelay. The
+    // mesh shows from beginTime to endTime, fading in/out over those ms.
+    std::string animName;
+    bool     loaderLoop = false;
+    uint32_t fadeIn = 0, fadeOut = 0;
+
+    // CActLightning: a textured beam between two points (gun tracers - the
+    // smash rifle's green rail). Layout from the S1 writers sub_62AD60 (node:
+    // 0.1, DestType, DestID, DestNodeName) and sub_637770 (CLightningData,
+    // version 0.5; 0.3 stops after UVScale, 0.4 has no Haze).
+    bool isLightning = false;
+    struct Beam {
+        uint32_t unitCount = 0;     // points along the line = unitCount + 2
+        uint32_t unitWidth = 0;     // world units across
+        int32_t  shakeDir = 0;      // >0 one side, <0 the other, 0 random
+        uint32_t shakeExtent = 0, shakeTime = 0;   // ms between new shakes
+        float    uvAnimSpeed = 0;   // texture scroll per second
+        uint32_t fadeIn = 0, fadeOut = 0;          // ms
+        std::string texture;
+        uint32_t blendType = 1;     // 1 = additive
+        float    uvScale = 1;
+        bool     curve = false;
+        float    curveScale = 0;
+    } beam;
 };
 
 struct Sequence {

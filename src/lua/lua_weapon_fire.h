@@ -28,6 +28,8 @@ struct WeaponAttack {
     float       power = 0;
     float       critMult = 0, critChance = 0;
     AttackShape shape;
+    std::vector<float> offsets;     // AddProjectileOffset x,y,z triples (shot pattern, cycles per shot)
+    std::vector<float> push;        // AddPushCondition (ms, speed, accel) triples - CPush on whoever it hits
 };
 
 // STATE:Set* fields the attack function sets on itself before ever touching
@@ -37,12 +39,28 @@ struct WeaponFireState {
     // InitLua is overloaded per native state. Only the jump-attack consumer
     // interprets [normalTime, delayTime, minimumSceneUpdateTime, onlyVStateNormal].
     std::vector<float> initArgs;
+    // STATE:InitLua has two signatures in the scripts: (normalMs, delayMs,
+    // minUpdateMs, bOnlyVStateNormal) and (minUpdateMs, lowerPartBeginMs,
+    // bOnlyVStateNormal, bEnableInputJump) - the plasma swings use the second
+    // (40, 500, false, false). A boolean third argument means the second form:
+    // no state window in the script, the clip's own length rules.
+    bool initTimed = true;
     bool hasDrop = false;
     float dropTime = 0.f, dropX = 0.f, dropY = 0.f, dropZ = 0.f;
-    float moveSpeedRate = 1.f;
+    float moveSpeedRate = 0.f;   // STATE:SetMoveSpeedRate; unset -> WASD does not move you during the attack
     float moveBoxMultiplier = 1.f;
+    // STATE:SetUseMoveBox(true). CAttackSpyDaggerState::Tick (S10 sub_106C1E0)
+    // only applies the MoveBox delta when this is set; plain CAttackState
+    // (sub_1075BA0) applies it always.
+    bool  useMoveBox = false;
     float hitStopA = 0.f, hitStopB = 0.f;
     bool  stealthCancel = false;
+    // STATE:AddSequence(index, file, sound, startTime, endTime): an effect
+    // .seq plus its sound, started startTime ms into the attack and kept for
+    // endTime ms (e.g. the plasma jump attack's skill_swordman_strike.seq +
+    // sword_power.ogg at 500 ms).
+    struct Sequence { int index = 0; std::string file, sound; float startMs = 0.f, endMs = 0.f; };
+    std::vector<Sequence> sequences;
 };
 
 // Corre <funcName>( OneShotTime, Power, Accuracy, AdditionalPower ) de <luaFile> (uno real de

@@ -24,6 +24,13 @@ function V3:GetZ() return self.z end
 
 -- RotateY/RotateZ: rotacion est�ndar mano-izquierda alrededor del eje, en GRADOS (los .lua
 -- reales pasan valores como 15.0/90/45 directamente).
+function V3:RotateX(deg)   -- weapon_smg4.lua StandardShockWave, weapon_mg2.lua StandardMg2
+  local a = toRad(deg); local c, s = math.cos(a), math.sin(a)
+  local y, z = self.y, self.z
+  self.y = y * c - z * s
+  self.z = y * s + z * c
+  return self
+end
 function V3:RotateY(deg)
   local a = toRad(deg); local c, s = math.cos(a), math.sin(a)
   local x, z = self.x, self.z
@@ -69,7 +76,11 @@ STATE = {
   SetCameraShakeFactor1 = function(self, ...) self.cameraShakeFactor1 = { ... } end,
   SetCameraShakeFactor2 = function(self, ...) self.cameraShakeFactor2 = { ... } end,
   AddSequence = function(self, index, file, sound, startTime, endTime)
-    self.sequences = self.sequences or {}
+    -- rawget: the lenient metatable hands back a stub function for unknown
+    -- fields, so "self.sequences or {}" got that function and table.insert
+    -- failed - every swing calling AddSequence before InitLua (plasma jump
+    -- attack: its SetDrop/stun) aborted.
+    if type(rawget(self, 'sequences')) ~= 'table' then self.sequences = {} end
     table.insert(self.sequences, { index = index, file = file, sound = sound, startTime = startTime, endTime = endTime })
   end,
   SetMoveBoxMultiplier = function(self, v) self.moveBoxMultiplier = v end,
@@ -85,19 +96,34 @@ STATE = {
   SetMaxAttackCount = function(self, v) end,
   SetStateMinSp = function(self, v) end,
   SetSpendSp = function(self, v) end,
+  SetCoolTime = function(self, v) self.coolTime = v end,
 }
+
+-- The S10 scripts call more STATE/WEAPON/Attack methods than this shim models
+-- (SetCoolTime cut StandardCounterSwordJumpDash off before its SetDrop). An
+-- unknown method is a no-op instead of an error, so every script runs to the
+-- end and the values that ARE read (InitLua, SetDrop, ...) are always set.
+local function noop() end
+local lenient = { __index = function(t, k) return noop end }
+setmetatable(STATE, lenient)
 
 WEAPON = {
   ApplyRandomDamage = function(self, atk) return atk end,
-  GetRange = function(self) return RayDistanceLimit end,
+  GetRange = function(self) return 3000.0 end,   -- melee reach as before (not the 25000 shot ray)
   GetFloat = function(self, index) return 0 end,
 }
+setmetatable(WEAPON, lenient)
+-- ACTORSTATE (the client binds it next to STATE, sub_12BFD40): the original
+-- gun scripts call ACTORSTATE:SetGunSpreadType / SetInnerAccuracyVary on it.
+ACTORSTATE = setmetatable({}, lenient)
 
-RayDistanceLimit = 3000.0
+RayDistanceLimit = 25000.0   -- client: dword_256B3A4 (FUN_012bfd40)
+-- weapon_init.lua (loaded by the client before every weapon file):
+if API_VERSION == nil then API_VERSION = 1 end
 ATTACKS = {}
 
 local Attack = {}
-Attack.__index = Attack
+Attack.__index = function(t, k) return rawget(Attack, k) or noop end
 local function newAttack(explosion)
   return setmetatable({ explosion = explosion, blow = {}, push = {}, stun = {} }, Attack)
 end
@@ -126,5 +152,12 @@ function Attack:SetCameraShakeSetFactor2(...) end
 function Attack:SetCameraShakeRandomDir(...) end
 function Attack:SetCameraShakeWhenSuccess(...) end
 function Attack:SetPlaySound(v) self.playSound = v end
+-- Shot pattern: one offset per shot, cycling (x, y, z with z = -1 forward).
+-- API_VERSION 1 scripts call AddProjectileOffset, 2 AddPatternPoint.
+function Attack:AddProjectileOffset(x, y, z)
+  if type(rawget(self, 'offsets')) ~= 'table' then self.offsets = {} end
+  table.insert(self.offsets, { x = x, y = y, z = z })
+end
+Attack.AddPatternPoint = Attack.AddProjectileOffset
 
 function AddAttack(list, atk) table.insert(list, atk) end

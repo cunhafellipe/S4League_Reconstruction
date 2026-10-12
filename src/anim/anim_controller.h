@@ -12,81 +12,9 @@ namespace anim {
 
 class LuaStates;   // actorstates.h
 
-// CStateMachine core recovered from the old client:
-// CanEnter -> OnLeave(previous) -> save previous/current -> OnEnter(new).
-// WAIT/STANDBY are empty Lua states and therefore deliberately keep the last
-// pose for their transition frame; NORMAL/RUN then select the real clip.
-class ActorStateMachine {
-public:
-    using CanEnter = std::function<bool(ActorState)>;
-    using Callback = std::function<void(ActorState)>;
-
-    ActorState current() const { return current_; }
-    ActorState previous() const { return previous_; }
-
-    bool SetCurrentState(ActorState next, const CanEnter& canEnter = {}) {
-        if (next == current_ || (canEnter && !canEnter(next))) return false;
-        if (onLeave_) onLeave_(current_);
-        previous_ = current_;
-        current_ = next;
-        if (onEnter_) onEnter_(current_);
-        return true;
-    }
-
-    void SetCallbacks(Callback onEnter, Callback onLeave) {
-        onEnter_ = std::move(onEnter);
-        onLeave_ = std::move(onLeave);
-    }
-
-    // Input-to-state path used by WorldState. Stop from locomotion passes
-    // through STANDBY for exactly one update, matching the empty state in the
-    // recovered actorstates script before NORMAL is entered.
-    void Request(ActorState wanted) {
-        if (transitionTarget_ != kNone && (current_ == STATE_WAIT || current_ == STATE_STANDBY)) return;
-        const bool locomotion = wanted == STATE_NORMAL || wanted == STATE_RUN ||
-                                wanted == STATE_FASTRUN || wanted == STATE_SIT;
-        const bool action = current_ == STATE_JUMP || current_ == STATE_FALL ||
-                            current_ == STATE_DODGE_LEFT || current_ == STATE_DODGE_RIGHT ||
-                            current_ == STATE_BOUNDJUMP;
-        if (locomotion && action) {
-            SetCurrentState(STATE_WAIT);
-            transitionTarget_ = wanted;
-            return;
-        }
-        if (wanted == STATE_NORMAL && (current_ == STATE_RUN || current_ == STATE_FASTRUN)) {
-            SetCurrentState(STATE_STANDBY);
-            transitionTarget_ = STATE_NORMAL;
-            return;
-        }
-        SetCurrentState(wanted);
-        transitionTarget_ = kNone;
-    }
-
-    // Action states use the real WAIT -> STANDBY -> locomotion return path.
-    void FinishAction(ActorState wanted) {
-        if (current_ != STATE_WAIT && current_ != STATE_STANDBY)
-            SetCurrentState(STATE_WAIT);
-        transitionTarget_ = wanted;
-    }
-
-    void EndFrame() {
-        if (transitionTarget_ == kNone) return;
-        if (current_ == STATE_WAIT) SetCurrentState(STATE_STANDBY);
-        else if (current_ == STATE_STANDBY) {
-            const ActorState next = transitionTarget_;
-            transitionTarget_ = kNone;
-            SetCurrentState(next);
-        }
-    }
-
-private:
-    static constexpr ActorState kNone = static_cast<ActorState>(0xff);
-    ActorState current_ = STATE_NORMAL;
-    ActorState previous_ = STATE_NORMAL;
-    ActorState transitionTarget_ = kNone;
-    Callback onEnter_;
-    Callback onLeave_;
-};
+// The actor state machine itself lives in src/game/actor_fsm.h (rebuilt from
+// the beta client's own tables); this file only plays the animation for
+// whatever state it reports.
 
 struct AnimCtx {
     float inX = 0.f, inZ = 0.f;        // move dir, camera-relative: A=-x D=+x, W=+z S=-z
@@ -99,7 +27,14 @@ struct AnimCtx {
     float refSpeed = 300.f;
     bool  jumpMoving = false;
     int   dodgeDir = -1;               // 0 front / 1 back / 2 left / 3 right / -1 none
+    // CDodgeState timers (game_tempos.x7 dodge_dodge_time / dodge_delay, ms).
+    // The client stretches the dodge clips to exactly these - see kDodge*Ph.
+    float dodgeSlideMs = 225.f, dodgeDelayMs = 375.f;
+    // jump_time (game_tempos.x7 idx 30): CJumpState's rise timer, the
+    // duration ApplyAnim fits the rise clips (00001 / 00004) to.
+    float jumpTimeMs = 700.f;
     int   weakCombo = 0;               // which SwordAtkWeakState_<X> row to play (combo chain index)
+    bool  ironBoots = false;           // Iron Boots worn: ActorState_FastRun's IRON_BOOTS row (IB068)
     float syncWindowMs = 0.f;
     float blendMin = 0.f, blendMax = 1e9f;
     std::function<float(const std::string&)> durOf;   // authored clip duration in native ticks, or 0
@@ -122,20 +57,54 @@ public:
     // but now points at a different weapon's clip table.
     void ForceRefresh() { paramIdx_ = -1; }
 
+    // Replay the current state from its first phase - called on every
+    // game::ActorFsm state entry. In the client OnEnter calls
+    // SetAnimation(..., RESET_TRUE), which rewinds the clip to tick 0 even
+    // when the same state is entered again (ChangeState has no same-state
+    // guard); seqState_/paramIdx_ alone would not notice that re-entry.
+    void Restart() { restart_ = true; }
+
+    // SetAnim blendIn / blendOut (native ticks) of the clip now playing - the
+    // scene-level fader needs them when an attack takes over or hands back.
+    int CurBlendInTicks() const  { return curBlendIn_; }
+    int CurBlendOutTicks() const { return prevBlendOut_; }
+
     // Legacy entry point (pre-1:1-port scenes.cpp): loads BaseParams + WeaponDefs
     // (actorstates.h) from an already-parsed LuaStates, plus the weapon's
     // weak/strong attack rows into STATE_USE_WEAPON1_WEAK/STRONG (combat isn't
     // part of scn_anim.js's AnimController - see anim_states.h). Returns how many
     // states/attacks ended up covered.
-    int LoadFromLua(const LuaStates& lua, const char* weapon);
+    // normalAs / runAs: the item's own weapon_lua.x7 rows when they name another
+    // weapon's NormalState_/RunState_ (Rapier: SpyDagger idle, Katana run,
+    // PlasmaSword attacks) - those two state tables come from that suffix.
+    int LoadFromLua(const LuaStates& lua, const char* weapon, const char* normalAs = nullptr, const char* runAs = nullptr);
     // Rows loaded for state `s` (0 = not covered) - scenes.cpp uses this to know
     // whether STATE_USE_WEAPON1_WEAK/STRONG have any attack data for this weapon.
     int LuaRowCount(ActorState s) const;
+    // The SetAnim rows loaded for a state (nullptr if none) - scenes.cpp reads
+    // RUN's UPPER (0..7) / LOWER (8..15) halves to drive torso and legs apart.
+    const std::vector<SAnimParam>* StateRows(ActorState s) const { return StateDef(s); }
 
     // Cross-fade tuning read by Update() when the caller's AnimCtx doesn't set
     // blendMin/blendMax itself (kept for the debug menu in scenes.cpp; S4Web2's
     // own menu instead sets ctx.blendMin/blendMax directly each frame).
-    float blendFloorMs = 100.f, blendCapMs = 250.f;
+    //
+    // Default is NO CLAMP on purpose: the blend times are authored per clip in
+    // the real ActorStates_GamePlay.lua and the engine honours them as-is.
+    // Verified against the beta client (full C++ symbols):
+    // Game::Utility::CAnimParam::SetAnim stores the Lua args verbatim
+    // (startMs->this+84, blendIn->this+64, blendOut->this+68, loop, rate,
+    // reset) with no clamping anywhere, and Crossfader below - the part this
+    // file itself marks "1:1 C++" - also runs unclamped.
+    // The old 100/250 default silently crushed every authored blend:
+    //   ActorState_BoundJump  RISE_B  blendOut=1000 -> 250  (wall jump)
+    //   ActorState_BoundJump  FALL/LANDING blendIn=500 -> 250
+    //   ActorState_Fall       FALLING blendIn=1000 -> 250
+    //   ActorState_Dodge      LEFT    blendOut=700  -> 250
+    // which is what read as "no weight, no fluid transition": the long blends
+    // the animators authored were being played at a quarter of their length.
+    // The F3 menu can still dial a clamp in for experiments.
+    float blendFloorMs = 0.f, blendCapMs = 1e9f;
     // multiplies clockScale in Update(). .scn clip durations/ticks are in
     // native tick units (idle=8000, walk=3200, dodge=7200...), not real ms -
     // without this factor EVERY clip (not just locomotion, which also gets
@@ -158,11 +127,13 @@ private:
     bool  locoA_ = false, locoB_ = false;
     bool  loopA_ = true, loopB_ = true;
     int   prevBlendOut_ = 0;
+    int   curBlendIn_ = 0;
 
     ActorState seqState_ = STATE_NORMAL;
     int   phaseIdx_ = 0;
     float phaseClock_ = 0.f;
     bool  actionBusy_ = false;
+    bool  restart_ = false;
 };
 
 // Generic 2-clip cross-fader for a stream of SAnimParam (per-weapon attack

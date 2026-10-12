@@ -23,11 +23,26 @@ struct Pose {
     uint32_t tickA = 0, tickB = 0;
     float blend = 0.f;
     bool loopA = true, loopB = true;
+    // Outgoing pose being faded out (CBlendingTransformAnimator's "from"
+    // animation, sub_7324D0/sub_731AC0): its own A/B pair, mixed over the
+    // pose above with weight fromWeight (1 = all outgoing, 0 = none).
+    std::string fromA, fromB;
+    uint32_t fromTickA = 0, fromTickB = 0;
+    float fromBlend = 0.f, fromWeight = 0.f;
+    bool fromLoopA = true, fromLoopB = true;
+    // Weapons only: the scene's default clip (the one listed right after
+    // base). A BONE without the current clip holds this clip's first frame
+    // before falling back to its base track (dragonsoul_iridescent_r: its
+    // CS_Right_Dummy only has base + R0003, and base turns the blade around).
+    std::string fallbackClip;
 };
 using AnimPose = Pose;   // legacy name (pre-1:1-port scenes.cpp)
 
 // Animated node matrix (row-major) at `tick`, relative to bind (identity at tick 0).
 Mat4 SampleNode(const Model& m, uint32_t tick);
+// A model's visibility (opacity) track at tick: the clip's own anim, else the
+// model's only anim; 1 when it has no visibility keys.
+float ModelVisibility(const Model& m, const std::string& clipName, uint32_t tick, bool loop);
 // Same, writing into a caller-owned float[16] (legacy call shape).
 void SampleNode(const Model& m, uint32_t tick, float out16[16]);
 
@@ -52,10 +67,15 @@ bool IsLowerBodyBone(const std::string& boneName);
 // instead of `pose` - legs keep walking/standing on their own real clip while
 // the rest of the body plays an attack, matching the real engine's separate
 // upper/lower body state machines instead of one clip driving everything.
+// externalParentsBind (optional): the same external parents in their BIND
+// pose. A bone hung off an external parent with no clip of its own then
+// keeps its authored offset from it (bone.matrix is absolute) instead of
+// having the parent applied twice.
 std::vector<Mat4> ResolveBoneWorlds(const Scene& sc, const Pose& pose,
                                      const float* swayTime = nullptr,
                                      const std::unordered_map<std::string, Mat4>* externalParents = nullptr,
-                                     const Pose* lowerPose = nullptr);
+                                     const Pose* lowerPose = nullptr,
+                                     const std::unordered_map<std::string, Mat4>* externalParentsBind = nullptr);
 
 bool BoneWorldByName(const Scene& sc, const std::string& boneName, const Pose& pose, Mat4& out);
 // Same, writing into a caller-owned float[16] (legacy call shape).
@@ -65,11 +85,16 @@ const Mat4* BoneWorldByNameW(const Scene& sc, const std::string& boneName, const
 // Linear-blend skin `m` against `sc`'s skeleton posed by `pose` (or a precomputed
 // `world[]`). Returns flat x,y,z,... positions; unmatched vertices keep bind pose.
 std::vector<float> SkinModel(const Model& m, const Scene& sc, const Pose& pose);
-std::vector<float> SkinModelW(const Model& m, const Scene& sc, const std::vector<Mat4>& world);
+std::vector<float> SkinModelW(const Model& m, const Scene& sc, const std::vector<Mat4>& world,
+                              const std::unordered_map<std::string, Mat4>* extra = nullptr);
 // Same, appending Vec3 (legacy call shape).
 void SkinModel(const Model& m, const Scene& sc, const Pose& pose, std::vector<Vec3>& out);
 // Same, with a separate lower-body pose (see ResolveBoneWorlds).
 void SkinModel(const Model& m, const Scene& sc, const Pose& pose, const Pose* lowerPose, std::vector<Vec3>& out);
+// Same, with world matrices for skin bones the skeleton does not have (a body
+// part's own dummies, e.g. Hair_Bone_Dummy on the female hair).
+void SkinModel(const Model& m, const Scene& sc, const Pose& pose, const Pose* lowerPose,
+               const std::unordered_map<std::string, Mat4>& extra, std::vector<Vec3>& out);
 
 // Inverse of a weapon's mount dummy, for placing its pieces relative to it
 // (world = piece.matrix * WeaponMountInverse * handBoneWorld). If the dummy's
@@ -78,6 +103,17 @@ void SkinModel(const Model& m, const Scene& sc, const Pose& pose, const Pose* lo
 // weapon spans z=[-184,49]) - only its ROTATION is usable then (translation
 // zeroed). world.html's own weapon-attach logic, not part of scn_skin.js.
 void WeaponMountInverse(const Scene& sc, const Bone& mount, float invOut[16]);
+
+// World of a node (model or bone) in its scene's own space, from the initial
+// transform of each node's OWN track ("BASE", else its first transform track)
+// chained up the parent links - how the SCN importer places every object
+// (local = its animation, over its parent). False if any node on the chain
+// has no track. The static matrices usually match this, but not always
+// (dragonmachinegun's flamethrower, 138_male_hair): the tracks win.
+// passContainer: walk through a trackless identity node (BONESYSTEM) instead
+// of failing. Only the draw loop's "did the clip move the mount" test uses it:
+// applied to every piece it moved twinsword/darkness_twinblade off the grip.
+bool TrackWorld(const Scene& sc, const std::string& name, Mat4& out, bool passContainer = false);
 
 // Resolves each weapon MODEL's world matrix in the weapon's own scene space
 // (same frame as the mount dummy), picking per-piece between FLAT (m.matrix

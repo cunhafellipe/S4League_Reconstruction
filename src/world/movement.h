@@ -15,21 +15,32 @@ struct MoveTuning {
     // Straight off the live game_tempos.x7 (GAMETEMPO_FREE/GAMETEMPO_CLUB -
     // the only two blocks not commented out; GAMETEMPO_LT5's block above them
     // is dead/legacy data): actor_default_move_speed=1100 (WALK),
-    // fastrun_speed_rate=2.0 -> RUN=2200, gravity=-7500, jump_force=2700.
-    // Earlier guesses reverse-derived from a live capture were close on
-    // gravity/dodge but off on WALK/JUMP/dodge_dodge_time - this replaces them
-    // with the exact authored values instead.
-    float WALK = 1100.f, RUN = 2200.f, JUMP = 2700.f, GRAV = 7500.f;
+    // gravity=-7500, jump_force=2700.
+    // RUN (the FASTRUN speed) = WALK * 1.5, NOT * 2.0: game_tempos.x7 carries
+    // fastrun_speed_rate twice - 1.5 under <common_action> and 2.0 under
+    // <game_value> - but the beta's name table (sub_6EEEA0) only knows the
+    // <common_action> one (index 3); the <game_value> attribute maps to no
+    // index and is dropped on load. CFastRunState::Tick reads index 3.
+    float WALK = 1100.f, RUN = 1650.f, JUMP = 2700.f, GRAV = 7500.f;
+    // max_gravity_velocity (tempo idx 19, sub_6EEEA0): the actor's terminal
+    // fall speed (actor+136). Gravity never pushes velY below it.
+    float MAX_FALL = -7500.f;
     float STEP_H = 110.f;    // step height that gets climbed automatically (wall rays start above it)
     float REFSPEED = 915.f;  // actor_default_animation_move_speed - speed a locomotion clip plays at 1x
     float COLL_R = 55.f;     // character collision radius
     // dodge_speed/dodge_decel/dodge_dodge_time straight off game_tempos.x7 too.
-    float dodgeSpeed = 2250.f, dodgeDecel = 4500.f, dodgeTime = 0.4f;
+    float dodgeSpeed = 2250.f, dodgeDecel = 4500.f;
+    float dodgeSlideTime = 0.225f, dodgeDelay = 0.375f, dodgeTime = 0.600f;
     // GAMETEMPO_FREE common_action: walljump_*.
     float wallJumpForce = 3125.f, wallJumpDelay = 0.2f, wallJumpTime = 0.5f, wallJumpLandingTime = 0.2f;
+    // CBoundJumpState::SetPhase(1) (sub_7E3060): launch = (reflected.x * 0.75,
+    // 1.0, reflected.z * 0.75) * walljump_jump_force - horizontal 0.75 of it.
+    float wallJumpHorizRate = 0.75f;
     float crouchMul = 0.5f;   // sit_speed_rate
     // front_speed_rate/side_speed_rate/back_speed_rate.
     float dirFront = 1.0f, dirSide = 0.95f, dirBack = 0.9f;
+    float land_move_rate = 0.6f;
+    float jump_landdelay = 0.3f;
     float charYawFollowRate = 14.f;   // body yaw exp-decay toward camera yaw
 };
 
@@ -38,6 +49,7 @@ struct MoveTuning {
 // needed) within maxDist. dir is NOT normalized by the caller - implementer
 // normalizes internally same as hitWall() in world.html.
 using HitTestFn = std::function<bool(float ox, float oy, float oz, float dx, float dz, float maxDist)>;
+using HitNormalFn = std::function<bool(float ox, float oy, float oz, float dx, float dz, float maxDist, float& outNx, float& outNz)>;
 // Floor height under (x,z), casting down from fromY. Returns false if no hit.
 using FloorFn = std::function<bool(float x, float z, float fromY, float& outY)>;
 
@@ -48,6 +60,10 @@ struct MoveState {
     bool  grounded = false;
     bool  didJump = false;
     bool  jumpMoving = false;
+    // Took off with any direction held - CJumpState's "moving jump" (phases
+    // 3/4), the only kind that can wall-jump. jumpMoving above is narrower
+    // (forward only) and just picks the run-jump clip.
+    bool  jumpHadDir = false;
     float dodgeVX = 0.f, dodgeVZ = 0.f, dodgeTimeLeft = 0.f;
     int   dodgeDir = -1;         // 0 front / 1 back / 2 left / 3 right (matches anim::AnimCtx.dodgeDir)
     float wallJumpDelayLeft = 0.f, wallJumpTimeLeft = 0.f;
@@ -76,6 +92,15 @@ struct MoveInput {
     float camYaw = 0.f;
     float weaponWeightMul = 1.f;     // e.g. 0.917 for plasma sword (captured live via x32dbg)
     float speedMul = 1.f;            // external gameplay multiplier; neutral for base locomotion
+    // Actor physics switched off (actor+128 = 0, sub_434190(0)): CAttackState
+    // does it during STATE:SetDrop's wait and CBoundJumpState during the wall
+    // jump's delay. The actor hangs in the air - no gravity and no vertical
+    // motion - until the flag comes back (the drop then writes the velocity).
+    bool  gravityOff = false;
+    // Terminal fall speed for this frame (actor+136, sub_4341B0). 0 = the
+    // tempo's max_gravity_velocity. SetDrop sets it to the drop's Y, so the
+    // dive keeps that exact speed instead of accelerating.
+    float maxFallVel = 0.f;
 };
 
 struct MoveResult {
@@ -104,7 +129,8 @@ public:
     // gameplay-specific and stay with the caller (same as world.html keeps them
     // in the main loop, calling MoveXZ directly for knockback/dodge impulses).
     MoveResult Tick(MoveState& s, const MoveInput& in, const HitTestFn& hitWall,
-                    const FloorFn& floorAt, float dt) const;
+                    const HitNormalFn* hitNormal, const FloorFn& floorAt,
+                    float dt) const;
 
 private:
     MoveTuning tuning_;

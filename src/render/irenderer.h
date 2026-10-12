@@ -18,8 +18,15 @@ struct IRenderer {
     bool vsync         = false;
     bool swapCopy      = false;
     bool multithreaded = false;
+    // Graphics quality: 0 low, 1 medium, 2 high (texture filtering, MSAA,
+    // particle density - see CRendererD3D::ApplyMeshSampler / DrawEffects).
+    int  quality       = 2;
 
     virtual ~IRenderer() = default;
+    // Window resized / quality changed: queued, applied at the next BeginFrame
+    // (a D3D9 device can't be Reset between BeginScene and EndScene).
+    virtual void RequestResize(int w, int h) { (void)w; (void)h; }
+    virtual void RequestQuality(int q) { quality = q; }
     virtual bool Init()       = 0;
     virtual bool CanRender()  = 0;
     virtual void BeginFrame() = 0;   // clear + begin scene
@@ -77,13 +84,36 @@ struct IRenderer {
     // Restrict 3D rendering to a screen rect (character preview panel). (0,0,0,0)
     // = full backbuffer. Also sets the perspective aspect for SetCamera3D.
     virtual void SetViewport(int x, int y, int w, int h) { (void)x;(void)y;(void)w;(void)h; }
+    // Clears color + depth inside the current viewport only (preview panels
+    // drawn over the world start from an empty background).
+    virtual void ClearViewport(uint32_t argb) { (void)argb; }
 
-    // Particle effects: a batch of camera-facing colored squares. `particles`
-    // is 8 floats per particle - x,y,z (world position), r,g,b,a (tint 0..1),
-    // size (world-space edge length). tex < 0 draws an untextured tinted
-    // square. additive picks glow-style blending (fire, energy, sparks) over
+    // Particle effects: a batch of camera-facing colored rectangles.
+    // `particles` is 9 floats per particle - x,y,z (world position), r,g,b,a
+    // (tint 0..1), width, height (world units; .seq keys carry them apart,
+    // e.g. 5 x 300 lightning streaks). tex < 0 draws an untextured tinted
+    // quad. additive picks glow-style blending (fire, energy, sparks) over
     // regular alpha blending (smoke, dust).
-    virtual void DrawParticles(const float* particles, int count, int tex, bool additive) {
-        (void)particles;(void)count;(void)tex;(void)additive;
+    // 12 floats per particle: the 9 above + velocity (world). renderType 1
+    // (.seq CActParticle) = streak: the height runs along the on-screen
+    // velocity (fastrun / lightning trails); 0 = plain camera-facing quad;
+    // 2 = a 3D segment: centred at x,y,z, spanning the full vector p[9..11].
+    // 10..13 = .seq CActParticle RenderType 0..3 as the client builds them
+    // (S10 sub_1C8D470): width/height are HALF extents;
+    // 10 faces the camera, 12 stands upright turning only about Y, 13 lies
+    // flat (XZ) - all three turned by p[9] degrees; 11 stretches along the
+    // velocity p[9..11] (h along it, w across).
+    // Optional .seq UV pairs: top-left, bottom-left, top-right, bottom-right.
+    virtual void DrawParticles(const float* particles, int count, int tex, bool additive, int renderType, const float* uv = nullptr) {
+        (void)particles;(void)count;(void)tex;(void)additive;(void)renderType;(void)uv;
+    }
+    // A camera-facing textured ribbon through `count` world points (3 floats
+    // each) - .seq CActLightning beams. u runs along the ribbon from u0 to u1
+    // (the texture repeats and scrolls), v across it; argb tints/fades.
+    // Opacity for the next DrawMesh calls (.seq effect meshes fading in/out);
+    // 1 = as authored. Callers set it back to 1 after.
+    float meshFade = 1.f;
+    virtual void DrawBeam(const float* pts, int count, float width, uint32_t argb, int tex, bool additive, float u0, float u1) {
+        (void)pts;(void)count;(void)width;(void)argb;(void)tex;(void)additive;(void)u0;(void)u1;
     }
 };

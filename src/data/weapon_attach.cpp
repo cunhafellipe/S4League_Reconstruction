@@ -16,7 +16,48 @@ const std::unordered_map<std::string, WeaponAttachEntry>& LoadWeaponAttach(const
     auto& out = cache[resourcesPath];
 
     std::ifstream f((fs::path(resourcesPath) / "xml" / "weapon_attach.x7").string(), std::ios::binary);
-    if (!f) return out;
+    if (!f) {
+        // No weapon_attach.x7 in this resource set: use the 2008 beta's own
+        // table, which it hardcodes in Game::Weapon::CWeapon setup
+        // (sub_71F420 -> CWeapon::LoadWeaponModel sub_71EB40 for link=0
+        // pieces with a hand + holster node, sub_71E8C0 for link=1 pieces
+        // fixed to one node). Identical to the .x7 for every type it covers.
+        struct Row { int type, piece; const char* attack; int link; const char* idle; };
+        static const Row kBeta[] = {
+            { 0, 0, "R_Hand_Dummy",    0, "Spine_Dummy" },
+            { 1, 0, "R_Hand_Dummy",    0, "Gun_Dummy"   },
+            { 1, 1, "Bip01 L Forearm", 1, nullptr       },
+            { 2, 0, "R_Hand_Dummy",    0, "Gun_Dummy"   },
+            { 2, 1, "L_Hand_Dummy",    0, "Gun_Dummy"   },
+            { 3, 0, "R_Hand_Dummy",    0, "Gun_Dummy"   },
+            { 4, 0, "R_Hand_Dummy",    0, "Gun_Dummy"   },
+            { 5, 0, "L_Hand_Dummy",    0, "Spine_Dummy" },
+            { 6, 0, "R_Hand_Dummy",    0, "Spine_Dummy" },
+            { 7, 0, "R_Hand_Dummy",    0, "Spine_Dummy" },
+            { 8, 0, "Dummy_L",         1, nullptr       },
+            { 8, 1, "Dummy_R",         1, nullptr       },
+            { 9, 0, "Dummy_L",         1, nullptr       },
+            { 9, 1, "Dummy_R",         1, nullptr       },
+            {10, 0, "R_Hand_Dummy",    0, "Spine_Dummy" },
+            {11, 0, "Bip01 R Forearm", 1, nullptr       },
+            {12, 0, "Bip01 R Forearm", 1, nullptr       },
+            {13, 0, "R_Hand_Dummy",    0, "Spine_Dummy" },
+            {14, 0, "R_Hand_Dummy",    0, "Spine_Dummy" },
+            {14, 1, "L_Hand_Dummy",    0, "Spine_Dummy" },
+            {14, 2, "L_Hand_Dummy",    0, "Spine_Dummy" },
+            {15, 0, "Card_Dummy",      1, nullptr       },
+            {15, 1, "R_Hand_Dummy",    1, nullptr       },
+            {15, 2, "L_Hand_Dummy",    1, nullptr       },
+            {16, 0, "R_Hand_Dummy",    0, "Spine_Dummy" },
+        };
+        for (const Row& r : kBeta) {
+            WeaponAttachEntry e;
+            e.attack = r.attack; e.link = r.link;
+            if (r.idle) { e.idle = r.idle; e.hasIdle = true; }
+            out[std::to_string(r.type) + ":" + std::to_string(r.piece)] = std::move(e);
+        }
+        return out;
+    }
     std::ostringstream ss; ss << f.rdbuf();
     std::string xml = ss.str();
 
@@ -76,6 +117,12 @@ std::optional<int> TypeFromSuffix(const std::string& resourcesPath, const std::s
         typeName = "WEAPONTYPE_3_SWORD";
     auto iit = ids.find(typeName);
     return iit != ids.end() ? std::optional<int>(iit->second) : std::nullopt;
+}
+
+int AttachLink(const std::string& resourcesPath, int type, int sceneIndex) {
+    auto& table = LoadWeaponAttach(resourcesPath);
+    auto it = table.find(std::to_string(type) + ":" + std::to_string(sceneIndex));
+    return it == table.end() ? -1 : it->second.link;
 }
 
 std::string AttachBone(const std::string& resourcesPath, int type, int sceneIndex, bool idle) {

@@ -11,6 +11,7 @@ struct State {
     int  mx = 0, my = 0;   // cursor position (client space)
     long mouseDX = 0;      // raw relative mouse delta since last consume (WM_INPUT)
     long mouseDY = 0;      // consumer (WorldState mouse-look) resets these to 0
+    int  wheel = 0;        // WM_MOUSEWHEEL notches since last consume (+ = up / away)
 };
 inline State g;
 inline void ClearEdges() { g.anyKey = false; g.click = false; g.cycleAnim = false; }

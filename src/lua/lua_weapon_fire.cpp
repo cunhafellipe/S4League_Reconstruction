@@ -125,6 +125,33 @@ std::vector<WeaponAttack> RunWeaponFire(const char* scriptDirC, const char* shim
     std::string shimSrc;
     if (ok && ReadFile(shimPath, shimSrc)) {
         ok = RunString(L, shimSrc, "shim");
+        // Real require for split script trees: some move the attack bodies to
+        // script/attack/*.lua and pulls them in with require "script/attack/
+        // weapon_plasmasword_attack.lua" (no plasma dash, no lightsaber attacks
+        // without it). "Resources/Script/X" and "script/X" both resolve inside
+        // scriptDir; each file loads once; a missing file is a no-op like before.
+        std::string root = scriptDir;
+        for (char& c : root) if (c == '\\') c = '/';
+        std::string escaped;
+        for (char c : root) { if (c == '\\' || c == '"') escaped += '\\'; escaped += c; }
+        const std::string requireSrc =
+            "local __root = \"" + escaped + "\"\n"
+            "local __loaded = {}\n"
+            "function require(name)\n"
+            "  local n = string.gsub(name, '\\\\', '/')\n"
+            "  local low = string.lower(n)\n"
+            "  if string.sub(low, 1, 17) == 'resources/script/' then n = string.sub(n, 18)\n"
+            "  elseif string.sub(low, 1, 7) == 'script/' then n = string.sub(n, 8) end\n"
+            "  local key = string.lower(n)\n"
+            "  if __loaded[key] then return end\n"
+            "  __loaded[key] = true\n"
+            "  local f = io.open(__root .. '/' .. n, 'rb')\n"
+            "  if not f then return end\n"
+            "  local src = f:read('*a'); f:close()\n"
+            "  local chunk = loadstring(src, n)\n"
+            "  if chunk then pcall(chunk) end\n"
+            "end\n";
+        if (ok) RunString(L, requireSrc, "require");
     } else if (ok) {
         DbgLog("[lua_weapon_fire] no se encontro el shim en %s", shimPath);
         ok = false;
@@ -159,6 +186,7 @@ std::vector<WeaponAttack> RunWeaponFire(const char* scriptDirC, const char* shim
                         if (lua_istable(L, -1)) {
                             for (int i = 1, n = (int)lua_objlen(L, -1); i <= n; ++i) {
                                 lua_rawgeti(L, -1, i);
+                                if (i == 3 && lua_isboolean(L, -1)) outState->initTimed = false;
                                 outState->initArgs.push_back(lua_isboolean(L, -1)
                                     ? float(lua_toboolean(L, -1)) : float(lua_tonumber(L, -1)));
                                 lua_pop(L, 1);
@@ -170,12 +198,36 @@ std::vector<WeaponAttack> RunWeaponFire(const char* scriptDirC, const char* shim
                         lua_pop(L, 1);
                         outState->dropTime = ReadField(L, "dropTime", 0.f);
                         ReadVec3Field(L, "dropVector", outState->dropX, outState->dropY, outState->dropZ);
-                        outState->moveSpeedRate      = ReadField(L, "moveSpeedRate", 1.f);
+                        outState->moveSpeedRate      = ReadField(L, "moveSpeedRate", 0.f);   // unset = no WASD during the attack (CAttackState+292 = 0)
                         outState->moveBoxMultiplier   = ReadField(L, "moveBoxMultiplier", 1.f);
+                        lua_getfield(L, -1, "useMoveBox");
+                        outState->useMoveBox = lua_toboolean(L, -1) != 0;
+                        lua_pop(L, 1);
                         outState->hitStopA            = ReadField(L, "hitStopA", 0.f);
                         outState->hitStopB            = ReadField(L, "hitStopB", 0.f);
                         lua_getfield(L, -1, "stealthCancel");
                         outState->stealthCancel = lua_toboolean(L, -1) != 0;
+                        lua_pop(L, 1);
+                        lua_getfield(L, -1, "sequences");
+                        if (lua_istable(L, -1)) {
+                            for (int i = 1, n = (int)lua_objlen(L, -1); i <= n; ++i) {
+                                lua_rawgeti(L, -1, i);
+                                if (lua_istable(L, -1)) {
+                                    WeaponFireState::Sequence sq;
+                                    sq.index   = (int)ReadField(L, "index", 0.f);
+                                    sq.startMs = ReadField(L, "startTime", 0.f);
+                                    sq.endMs   = ReadField(L, "endTime", 0.f);
+                                    lua_getfield(L, -1, "file");
+                                    if (lua_isstring(L, -1)) sq.file = lua_tostring(L, -1);
+                                    lua_pop(L, 1);
+                                    lua_getfield(L, -1, "sound");
+                                    if (lua_isstring(L, -1)) sq.sound = lua_tostring(L, -1);
+                                    lua_pop(L, 1);
+                                    outState->sequences.push_back(std::move(sq));
+                                }
+                                lua_pop(L, 1);
+                            }
+                        }
                         lua_pop(L, 1);
                     }
                     lua_pop(L, 1);   // STATE
@@ -196,6 +248,29 @@ std::vector<WeaponAttack> RunWeaponFire(const char* scriptDirC, const char* shim
                             a.critMult     = ReadField(L, "critMult", 0);
                             a.critChance   = ReadField(L, "critChance", 0);
                             a.shape        = ReadShape(L);
+                            lua_getfield(L, -1, "push");
+                            if (lua_istable(L, -1)) {
+                                for (int k = 1, kn = (int)lua_objlen(L, -1); k <= kn; ++k) {
+                                    lua_rawgeti(L, -1, k);
+                                    if (lua_istable(L, -1)) {
+                                        for (int f = 1; f <= 3; ++f) { lua_rawgeti(L, -1, f); a.push.push_back((float)lua_tonumber(L, -1)); lua_pop(L, 1); }
+                                    }
+                                    lua_pop(L, 1);
+                                }
+                            }
+                            lua_pop(L, 1);
+                            lua_getfield(L, -1, "offsets");
+                            if (lua_istable(L, -1)) {
+                                for (int k = 1, kn = (int)lua_objlen(L, -1); k <= kn; ++k) {
+                                    lua_rawgeti(L, -1, k);
+                                    if (lua_istable(L, -1)) {
+                                        a.offsets.push_back(ReadField(L, "x", 0)); a.offsets.push_back(ReadField(L, "y", 0));
+                                        a.offsets.push_back(ReadField(L, "z", -1));
+                                    }
+                                    lua_pop(L, 1);
+                                }
+                            }
+                            lua_pop(L, 1);
                             out.push_back(std::move(a));
                         }
                         lua_pop(L, 1);

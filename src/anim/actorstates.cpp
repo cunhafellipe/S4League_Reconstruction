@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <cctype>
+#include <cstdlib>
 #include <regex>
 #include <sstream>
 
@@ -33,12 +35,21 @@ static const std::regex kSoundRe(
 static const std::regex kSeqRe(R"re(AddSequence\s*\(\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(\d+))re");
 static const std::regex kBlenderRe(R"(customAnimBlender\s*=\s*state\s*:\s*GetCustomAnimBlender\s*\(\s*(\d+)\s*\))");
 static const std::regex kBlendRe(
-    R"re(customAnimBlender\s*:\s*Get(Walk|Jump|Fly)(Upper|Lower)AnimParam\s*\(\s*(LOWER_ANIM_\w+)?\s*\)\s*:\s*SetBlendingAnim\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(LOOP_\w+)\s*,\s*([\d.]+)\s*,\s*(RESET_\w+)\s*\))re");
+    R"re(customAnimBlender\s*:\s*Get(Walk|Jump|Fly)(Upper|Lower)AnimParam\s*\(\s*(LOWER_ANIM_\w+)?\s*\)\s*:\s*SetBlendingAnim\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(LOOP_\w+)\s*,\s*([A-Za-z_]\w*|[\d.]+)\s*,\s*(RESET_\w+)\s*\))re");
 static const std::regex kFnRe(R"(function\s+(\w+)\s*\()");
 
 static std::string StripLowerAnimPrefix(const std::string& s) {
     static const std::string pfx = "LOWER_ANIM_";
     return s.rfind(pfx, 0) == 0 ? s.substr(pfx.size()) : s;
+}
+
+static float Scalar(const std::string& body, const std::string& token) {
+    char* end = nullptr;
+    const float literal = std::strtof(token.c_str(), &end);
+    if (end && *end == '\0') return literal;
+    std::smatch m;
+    const std::regex assignment("(?:local\\s+)?" + token + "\\s*=\\s*([0-9]+(?:\\.[0-9]+)?)");
+    return std::regex_search(body, m, assignment) ? std::stof(m[1].str()) : 1.f;
 }
 
 ParsedActorStates ParseActorStates(const std::string& scriptDir) {
@@ -99,7 +110,7 @@ ParsedActorStates ParseActorStates(const std::string& scriptDir) {
                 b.dir = m[3].matched ? StripLowerAnimPrefix(m[3].str()) : "";
                 b.clipA = m[4].str(); b.clipB = m[5].str();
                 b.startMs = std::stoi(m[6].str()); b.blendInMs = std::stoi(m[7].str()); b.blendOutMs = std::stoi(m[8].str());
-                b.loop = m[9].str() == "LOOP_TRUE"; b.rate = std::stof(m[10].str()); b.reset = m[11].str() == "RESET_TRUE";
+                b.loop = m[9].str() == "LOOP_TRUE"; b.rate = Scalar(body, m[10].str()); b.reset = m[11].str() == "RESET_TRUE";
                 fn.blend.push_back(std::move(b));
             }
             if (!fn.anims.empty() || !fn.sounds.empty() || !fn.seqs.empty() || !fn.blend.empty())
@@ -184,7 +195,7 @@ AttackAttribMap ParseAttackAttribs(const std::string& scriptDir) {
     static const std::regex dsRe(R"re(SetDamageSequence\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)")re");
     static const std::regex asRe(R"re(SetAttackSequence\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)")re");
     static const std::regex gbRe(R"re(SetGunBlastSequence\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)")re");
-    static const std::regex gtRe(R"re(SetGunTracerAttachNode\s*\(\s*"([^"]*)")re");
+    static const std::regex gtRe(R"re(SetGunTracerAttachNode\s*\(\s*"([^"]*)"\s*(?:,\s*"([^"]*)")?)re");
     static const std::regex powRe(R"(SetPower\s*\(\s*(POWER_\w+))");
     static const std::regex wtRe(R"(SetWeaponType\s*\(\s*(WEAPONTYPE_\w+))");
     static const std::regex kiRe(R"re(SetKillMessageImage\s*\(\s*"([^"]*)")re");
@@ -199,12 +210,15 @@ AttackAttribMap ParseAttackAttribs(const std::string& scriptDir) {
         if (std::regex_search(body, m, dmgRe)) a.damage = std::stoi(m[1].str());
         Match1(body, powRe, a.power);
         Match1(body, wtRe, a.weaponType);
-        if (std::regex_search(body, m, dsRe)) { a.hitSeq = m[1].str(); a.hitSound = m[3].str(); }
+        if (std::regex_search(body, m, dsRe)) { a.hitSeq = m[1].str(); a.hitSound = m[3].str(); a.wallHitSeq = m[2].str(); a.wallHitSound = m[4].str(); }
         if (std::regex_search(body, m, asRe)) { a.atkSeq = m[1].str(); a.atkSound = m[2].str(); }
         Match1(body, kiRe, a.killImg);
         bool haveGb = std::regex_search(body, m, gbRe);
         if (haveGb) { a.gunBlastSeq = m[1].str(); a.gunBlastSound = m[3].str(); a.gunFireBone = m[4].str(); }
-        else Match1(body, gtRe, a.gunFireBone);
+        if (std::regex_search(body, m, gtRe)) {
+            if (!haveGb) a.gunFireBone = m[1].str();
+            a.gunTracerSeq = m[2].str();
+        }
         out[marks[i].first] = std::move(a);
     }
     return out;
@@ -235,7 +249,9 @@ WeaponAttribs ResolveWeaponAttribs(const AttackAttribMap& attribMap, const std::
     for (auto* e : mine) if (!e->second.gunFireBone.empty()) { gunEntry = &e->second; break; }
 
     out.weak = weak; out.strong = strong;
-    if (gunEntry) { out.gunBlastSeq = gunEntry->gunBlastSeq; out.gunBlastSound = gunEntry->gunBlastSound; out.gunFireBone = gunEntry->gunFireBone; }
+    if (gunEntry) { out.gunBlastSeq = gunEntry->gunBlastSeq; out.gunBlastSound = gunEntry->gunBlastSound; out.gunFireBone = gunEntry->gunFireBone;
+                    out.gunWallSeq = gunEntry->wallHitSeq; out.gunWallSound = gunEntry->wallHitSound; out.gunTracerSeq = gunEntry->gunTracerSeq;
+                    out.gunHitSeq = gunEntry->hitSeq; out.gunHitSound = gunEntry->hitSound; }
     return out;
 }
 
@@ -346,7 +362,9 @@ WeaponAnim ResolveWeaponAnim(const ParsedActorStates& parsed, const std::string&
     out.sndJumpAtk = FirstSound(jatk);
     out.sndJumpAtkWeak = FirstSound(jweak);
     jweakStore = Upper(jweak); out.jumpAtkWeak = jweakStore.empty() ? nullptr : &jweakStore[0];
-    reloadStore = Upper(Get(parsed, "ReloadState_" + weapon)); out.reload = reloadStore.empty() ? nullptr : &reloadStore[0];
+    const ActorFunc* reload = Get(parsed, "ReloadState_" + weapon);
+    reloadStore = Upper(reload); out.reload = reloadStore.empty() ? nullptr : &reloadStore[0];
+    out.lowerReload = Lower(reload);
 
     out.isGun = !type.empty() && !isMelee;
     out.dmgWeak = at.weak ? at.weak->damage : 0;
@@ -361,6 +379,8 @@ WeaponAnim ResolveWeaponAnim(const ParsedActorStates& parsed, const std::string&
     out.seqJumpAtk = (jatk && !jatk->seqs.empty()) ? &jatk->seqs[0] : nullptr;
     out.seqJumpAtkWeak = (jweak && !jweak->seqs.empty()) ? &jweak->seqs[0] : nullptr;
     out.gunBlastSeq = at.gunBlastSeq; out.gunBlastSound = at.gunBlastSound; out.gunFireBone = at.gunFireBone;
+    out.gunWallSeq = at.gunWallSeq; out.gunWallSound = at.gunWallSound; out.gunTracerSeq = at.gunTracerSeq;
+    out.gunHitSeq = at.gunHitSeq; out.gunHitSound = at.gunHitSound;
     return out;
 }
 
@@ -379,16 +399,31 @@ std::vector<SAnimParam> ToSAnimParams(const std::vector<ActorAnim>& anims) {
     return out;
 }
 static std::vector<SAnimParam> ToParams(const std::vector<ActorAnim>& anims) { return ToSAnimParams(anims); }
+// RunState_<Weapon> carries 16 rows: ANIMPARAMLIST_UPPER_<dir> (torso, slots
+// 0..7) and ANIMPARAMLIST_LOWER_<dir> (legs, slots 8..15), by direction NAME -
+// the SetAnim calls are not written in slot order. They differ for the guns:
+// MachineGun's torso stays on F0018 (aiming) in every direction while its legs
+// go F0018..F0025; reading only the UPPER rows into both halves made the legs
+// run forward while strafing. A missing half falls back to the other one.
 static std::vector<SAnimParam> RunTable(const ActorFunc* runFn) {
     std::vector<SAnimParam> run(16);
+    std::vector<bool> have(16, false);
     for (const ActorAnim& a : Upper(runFn)) {
-        if (a.label.find("UPPER_") == std::string::npos) continue;
-        std::string d = a.label.rfind("ANIMPARAMLIST_UPPER_", 0) == 0 ? a.label.substr(20) : a.label;
+        int base;
+        std::string d;
+        if (a.label.rfind("ANIMPARAMLIST_UPPER_", 0) == 0)      { base = 0; d = a.label.substr(20); }
+        else if (a.label.rfind("ANIMPARAMLIST_LOWER_", 0) == 0) { base = 8; d = a.label.substr(20); }
+        else continue;
         auto it = kRunSlot.find(d);
         if (it == kRunSlot.end()) continue;
         SAnimParam p; p.clip = a.clip; p.startMs = a.startMs; p.blendInMs = a.blendInMs; p.blendOutMs = a.blendOutMs;
         p.rate = a.rate; p.reset = a.reset; p.loop = a.loop;
-        run[it->second] = p; run[it->second - 8] = p;
+        const int slot = (it->second - 8) + base;
+        run[slot] = p; have[slot] = true;
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (!have[i] && have[i + 8]) run[i] = run[i + 8];
+        if (!have[i + 8] && have[i]) run[i + 8] = run[i];
     }
     return run;
 }
@@ -428,6 +463,41 @@ std::unordered_map<int, BlendSlot> WeaponBlend(const ParsedActorStates& parsed, 
         // match the JS shape actually consumed downstream.
     }
     return out;
+}
+
+const BlendSlot* WeaponFireBlendSlot(const ParsedActorStates& parsed, const std::string& weapon) {
+    static std::unordered_map<int, BlendSlot> keepAlive;
+    // UseWeapon1State_<X>Attack / <X>Gun (smash rifle: SMG3Gun) / <X>, then any
+    // UseWeapon1State_<X><non-digit>... that has a blender (SMG must not take SMG3).
+    const std::string pre = "UseWeapon1State_" + weapon;
+    std::vector<std::string> names = { pre + "Attack", pre + "Gun", pre };
+    for (const auto& kv : parsed)
+        if (kv.first.size() > pre.size() && kv.first.compare(0, pre.size(), pre) == 0 &&
+            !std::isdigit((unsigned char)kv.first[pre.size()]) && !kv.second.blend.empty()) names.push_back(kv.first);
+    for (const std::string& fnName : names) {
+        keepAlive = WeaponBlend(parsed, fnName);
+        if (keepAlive.empty()) continue;
+        int best = -1;
+        for (auto& kv : keepAlive) if (kv.first > best) best = kv.first;
+        if (best >= 0 && !keepAlive[best].upper.empty()) return &keepAlive[best];
+    }
+    return nullptr;
+}
+
+std::unordered_map<std::string, ActorAnim> WeaponFireLower(const ParsedActorStates& parsed, const std::string& weapon) {
+    const std::string pre = "UseWeapon1State_" + weapon;
+    std::vector<std::string> names = { pre + "Attack", pre + "Gun", pre };
+    for (const auto& kv : parsed)
+        if (kv.first.size() > pre.size() && kv.first.compare(0, pre.size(), pre) == 0 &&
+            !std::isdigit((unsigned char)kv.first[pre.size()]) && !kv.second.blend.empty()) names.push_back(kv.first);
+    for (const std::string& n : names) {
+        const ActorFunc* fn = Get(parsed, n);
+        if (fn) {
+            auto lower = Lower(fn);
+            if (!lower.empty()) return lower;
+        }
+    }
+    return {};
 }
 
 const std::unordered_map<std::string, ActorBlend>* WeaponFireBlend(const ParsedActorStates& parsed, const std::string& weapon) {

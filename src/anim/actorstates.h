@@ -62,6 +62,8 @@ struct AttackAttrib {
     std::string power, weaponType;
     std::string hitSeq, hitSound, atkSeq, atkSound, killImg;
     std::string gunBlastSeq, gunBlastSound, gunFireBone;
+    std::string wallHitSeq, wallHitSound;   // SetDamageSequence args 2 and 4 (bullet on a wall)
+    std::string gunTracerSeq;               // SetGunTracerAttachNode arg 2 (the beam muzzle -> hit)
 };
 using AttackAttribMap = std::unordered_map<std::string, AttackAttrib>;
 AttackAttribMap ParseAttackAttribs(const std::string& scriptDir);
@@ -69,7 +71,7 @@ AttackAttribMap ParseAttackAttribs(const std::string& scriptDir);
 struct WeaponAttribs {
     const AttackAttrib* weak = nullptr;
     const AttackAttrib* strong = nullptr;
-    std::string gunBlastSeq, gunBlastSound, gunFireBone;
+    std::string gunBlastSeq, gunBlastSound, gunFireBone, gunWallSeq, gunWallSound, gunTracerSeq, gunHitSeq, gunHitSound;
 };
 WeaponAttribs ResolveWeaponAttribs(const AttackAttribMap& attribMap, const std::string& weaponType);
 
@@ -102,6 +104,7 @@ struct WeaponAnim {
     std::vector<ActorAnim> jumpAtk;  // NORMAL -> DELAY; do not discard the landing/recovery clip
     const ActorAnim* jumpAtkWeak = nullptr;
     const ActorAnim* reload = nullptr;
+    std::unordered_map<std::string, ActorAnim> lowerReload;
     std::unordered_map<std::string, ActorAnim> dmg;               // FRONT/BACK/LEFT/RIGHT
     bool isGun = false;
     int dmgWeak = 0, dmgStrong = 0;
@@ -109,7 +112,8 @@ struct WeaponAnim {
     const ActorSound* sndWeak = nullptr; const ActorSound* sndStrong = nullptr;
     const ActorSeq* seqWeak = nullptr; const ActorSeq* seqStrong = nullptr;
     const ActorSeq* seqJumpAtk = nullptr; const ActorSeq* seqJumpAtkWeak = nullptr;
-    std::string gunBlastSeq, gunBlastSound, gunFireBone;
+    std::string gunBlastSeq, gunBlastSound, gunFireBone, gunWallSeq, gunWallSound, gunTracerSeq;
+    std::string gunHitSeq, gunHitSound;   // SetDamageSequence args 1 and 3: a bullet on a player
 };
 // Owns the ActorFunc storage that WeaponAnim's pointers reference - keep this
 // alive as long as the returned WeaponAnim is used (same lifetime contract as
@@ -132,6 +136,13 @@ std::unordered_map<int, BlendSlot> WeaponBlend(const ParsedActorStates& parsed, 
 // Fire-hold pose per direction for guns with GetCustomAnimBlender. Returns
 // nullptr if the weapon has no such blend.
 const std::unordered_map<std::string, ActorBlend>* WeaponFireBlend(const ParsedActorStates& parsed, const std::string& weapon);
+// Both halves of that blender: Get*UpperAnimParam = aiming UP (A straight up,
+// B level), Get*LowerAnimParam = aiming DOWN (A straight down, B level) -
+// CCustomAnimBlender::Update (beta sub_723DC0). nullptr if none.
+const BlendSlot* WeaponFireBlendSlot(const ParsedActorStates& parsed, const std::string& weapon);
+// The same fire state's lowerPartStateSet rows (LOWER_ANIM_<dir> -> clip):
+// the legs while firing - E0008.. walking, AS002 (NORMAL) standing.
+std::unordered_map<std::string, ActorAnim> WeaponFireLower(const ParsedActorStates& parsed, const std::string& weapon);
 
 // Composes the fire-hold pose at time `t` (ms since fire/aim started).
 scn::Pose FireBlendPose(const ActorBlend* entry, float t);

@@ -14,6 +14,7 @@ struct Face { uint16_t a = 0, b = 0, c = 0; };
 
 struct VecKey  { uint32_t t; float v[3]; };
 struct QuatKey { uint32_t t; float q[4]; };
+struct VisKey  { uint32_t t; float v; };   // visibility (opacity) 0..1 at tick t
 
 struct Anim {
     std::string name;
@@ -24,6 +25,7 @@ struct Anim {
     float initS[3] = {1,1,1};
     std::vector<VecKey>  trans, scale;
     std::vector<QuatKey> rot;
+    std::vector<VisKey> vis;   // opacity track (effect meshes fade with it); empty = always 1
 };
 
 struct BoneWeight { uint32_t vertex; float weight; };
@@ -95,6 +97,17 @@ struct Scene {
     std::vector<Box> boxes;
     std::vector<std::string> animNames;
     std::vector<const Model*> meshes;   // models with geometry (positions+indices non-empty)
+    // Costume node parts only: skeleton bone the scene hangs from
+    // (item.x7 to_node_parent_nodeN). Empty = Bip01 Head.
+    std::string attachBone;
+    // Pets: the scene has its own skeleton and clips (alice.scn: its own
+    // Bip01..., 00074 idle). Skinned/posed with itself, not the character.
+    bool ownSkeleton = false;
+    // item.x7 to_node_animation_partN="1": the node plays the character's
+    // clip names itself, in character space (not carried by its bone).
+    bool animPart = false;
+    // Costume slot this part was loaded for (0 hair .. 7 pet), -1 otherwise.
+    int costumeSlot = -1;
     bool ok = false;
     std::string error;
 };

@@ -89,6 +89,25 @@ static Mat4 ComposeTRS(const Anim& a, uint32_t tick, bool loop = true) {
     return BuildTRS(T, q, S);
 }
 
+float ModelVisibility(const Model& m, const std::string& clipName, uint32_t tick, bool loop) {
+    const Anim* a = nullptr;
+    for (const Anim& x : m.anims) if (x.name == clipName) { a = &x; break; }
+    if (!a && m.anims.size() == 1) a = &m.anims[0];
+    if (!a || a->vis.empty()) return 1.f;
+    const uint32_t t = loop && a->duration ? (tick % a->duration) : tick;
+    const auto& k = a->vis;
+    if (t <= k.front().t) return k.front().v;
+    if (t >= k.back().t) return k.back().v;
+    for (size_t i = 1; i < k.size(); ++i) {
+        if (t <= k[i].t) {
+            const float span = (float)(k[i].t - k[i-1].t);
+            const float f = span > 0.f ? (float)(t - k[i-1].t) / span : 1.f;
+            return k[i-1].v + (k[i].v - k[i-1].v) * f;
+        }
+    }
+    return k.back().v;
+}
+
 Mat4 SampleNode(const Model& m, uint32_t tick) {
     if (m.anims.empty() || !m.anims[0].hasTransform) return kIdentity;
     const Anim& a = m.anims[0];
@@ -118,21 +137,33 @@ static bool SampleBoneTRS(const Bone& bone, const std::string& animName, uint32_
 // rot shortest-arc). std::nullopt = no clip/BASE data on this bone at all -
 // caller (ResolveBoneWorlds) reconstructs the local from the bone's own
 // absolute matrix.
+static void LerpTRS(const BoneTRS& A, const BoneTRS& B, float w, BoneTRS& out) {
+    for (int i = 0; i < 3; ++i) { out.T[i] = A.T[i] + (B.T[i]-A.T[i])*w; out.S[i] = A.S[i] + (B.S[i]-A.S[i])*w; }
+    float s = (A.q[0]*B.q[0]+A.q[1]*B.q[1]+A.q[2]*B.q[2]+A.q[3]*B.q[3]) < 0 ? -1.f : 1.f;
+    for (int i = 0; i < 4; ++i) out.q[i] = A.q[i] + (B.q[i]*s - A.q[i])*w;
+    float l = std::sqrt(out.q[0]*out.q[0]+out.q[1]*out.q[1]+out.q[2]*out.q[2]+out.q[3]*out.q[3]);
+    if (l > 1e-6f) for (float& c : out.q) c /= l;
+}
+
+// One A/B cross-fade layer. False when clip A has no track on this bone.
+static bool SampleLayer(const Bone& bone, const std::string& a, uint32_t ta, bool la,
+                        const std::string& b, uint32_t tb, bool lb, float blend, BoneTRS& out) {
+    if (!SampleBoneTRS(bone, a, ta, la, out)) return false;
+    if (blend > 0.001f && !b.empty() && b != a) {
+        BoneTRS B{};
+        if (SampleBoneTRS(bone, b, tb, lb, B)) { BoneTRS m{}; LerpTRS(out, B, blend > 1.f ? 1.f : blend, m); out = m; }
+    }
+    return true;
+}
+
 static std::optional<Mat4> SampleBonePose(const Bone& bone, const Pose& p) {
     BoneTRS A{};
-    bool okA = SampleBoneTRS(bone, p.clipA, p.tickA, p.loopA, A);
-    if (p.blend > 0.001f && !p.clipB.empty() && p.clipB != p.clipA && okA) {
-        BoneTRS B{};
-        if (SampleBoneTRS(bone, p.clipB, p.tickB, p.loopB, B)) {
-            float w = p.blend > 1.f ? 1.f : p.blend;
-            float T[3] = { A.T[0]+(B.T[0]-A.T[0])*w, A.T[1]+(B.T[1]-A.T[1])*w, A.T[2]+(B.T[2]-A.T[2])*w };
-            float S[3] = { A.S[0]+(B.S[0]-A.S[0])*w, A.S[1]+(B.S[1]-A.S[1])*w, A.S[2]+(B.S[2]-A.S[2])*w };
-            float s = (A.q[0]*B.q[0]+A.q[1]*B.q[1]+A.q[2]*B.q[2]+A.q[3]*B.q[3]) < 0 ? -1.f : 1.f;
-            float q[4];
-            for (int i = 0; i < 4; ++i) q[i] = A.q[i] + (B.q[i]*s - A.q[i])*w;
-            float l = std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
-            if (l > 1e-6f) { q[0]/=l; q[1]/=l; q[2]/=l; q[3]/=l; }
-            return BuildTRS(T, q, S);
+    bool okA = SampleLayer(bone, p.clipA, p.tickA, p.loopA, p.clipB, p.tickB, p.loopB, p.blend, A);
+    if (okA && p.fromWeight > 0.001f && !p.fromA.empty()) {
+        BoneTRS F{};
+        if (SampleLayer(bone, p.fromA, p.fromTickA, p.fromLoopA, p.fromB, p.fromTickB, p.fromLoopB, p.fromBlend, F)) {
+            BoneTRS m{}; LerpTRS(A, F, p.fromWeight > 1.f ? 1.f : p.fromWeight, m);
+            return BuildTRS(m.T, m.q, m.S);
         }
     }
     if (okA) return BuildTRS(A.T, A.q, A.S);
@@ -140,6 +171,10 @@ static std::optional<Mat4> SampleBonePose(const Bone& bone, const Pose& p) {
     // matrix, if the clip name matches something with a transform track).
     const Anim* a = FindAnim(bone, p.clipA);
     if (a && a->hasTransform) return ComposeTRS(*a, p.tickA, p.loopA);
+    if (!p.fallbackClip.empty()) {
+        const Anim* f = FindAnim(bone, p.fallbackClip);
+        if (f && f->hasTransform) return ComposeTRS(*f, 0, false);
+    }
     // Anchor bones (Sword_Wea_Dummy, R_Hand_Dummy...) usually carry their own
     // "BASE" clip with the correct offset already decomposed - prefer it over
     // reconstructing from the raw matrix (confirmed: skipping this breaks the
@@ -171,16 +206,22 @@ static Mat4 RotZ(float a) {
     return { c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1 };
 }
 
+// The client's own lower-body test (S10 sub_1270B30): a "Bip01" bone named
+// Thigh/Calf/Foot/Toe/Pelvis, or the root "Bip01" itself. Pelvis and root
+// belong to the LEGS: left on the upper (aim) clip, its turned hips twisted
+// the walking legs sideways.
 bool IsLowerBodyBone(const std::string& boneName) {
-    return boneName.find(" L Thigh") != std::string::npos || boneName.find(" R Thigh") != std::string::npos ||
-           boneName.find(" L Calf") != std::string::npos  || boneName.find(" R Calf") != std::string::npos ||
-           boneName.find(" L Foot") != std::string::npos  || boneName.find(" R Foot") != std::string::npos ||
-           boneName.find(" L Toe0") != std::string::npos  || boneName.find(" R Toe0") != std::string::npos;
+    if (boneName == "Bip01") return true;
+    if (boneName.find("Bip01") == std::string::npos) return false;
+    for (const char* k : { "Thigh", "Calf", "Foot", "Toe", "Pelvis" })
+        if (boneName.find(k) != std::string::npos) return true;
+    return false;
 }
 
 std::vector<Mat4> ResolveBoneWorlds(const Scene& sc, const Pose& pose, const float* swayTime,
                                      const std::unordered_map<std::string, Mat4>* externalParents,
-                                     const Pose* lowerPose) {
+                                     const Pose* lowerPose,
+                                     const std::unordered_map<std::string, Mat4>* externalParentsBind) {
     const size_t nb = sc.bones.size();
     std::vector<Mat4> local(nb), world(nb);
     std::vector<int> parent(nb, -1);
@@ -210,6 +251,10 @@ std::vector<Mat4> ResolveBoneWorlds(const Scene& sc, const Pose& pose, const flo
             if (parent[i] < 0) {
                 Mat4 m; std::memcpy(m.data(), sc.bones[i].matrix, sizeof(m));
                 local[i] = m;
+                if (extWorld[i] && externalParentsBind) {
+                    auto bit = externalParentsBind->find(sc.bones[i].parent);
+                    if (bit != externalParentsBind->end()) local[i] = Mat4Mul(m, Mat4InvAffine(bit->second));
+                }
             } else {
                 Mat4 bm; std::memcpy(bm.data(), sc.bones[i].matrix, sizeof(bm));
                 Mat4 pm; std::memcpy(pm.data(), sc.bones[parent[i]].matrix, sizeof(pm));
@@ -254,7 +299,8 @@ const Mat4* BoneWorldByNameW(const Scene& sc, const std::string& boneName, const
     return nullptr;
 }
 
-std::vector<float> SkinModelW(const Model& m, const Scene& sc, const std::vector<Mat4>& world) {
+std::vector<float> SkinModelW(const Model& m, const Scene& sc, const std::vector<Mat4>& world,
+                              const std::unordered_map<std::string, Mat4>* extra) {
     std::vector<float> out = m.positions;
     if (m.skin.empty() || sc.bones.empty() || world.empty()) return out;
 
@@ -268,7 +314,12 @@ std::vector<float> SkinModelW(const Model& m, const Scene& sc, const std::vector
         auto it = boneIdx.find(sb.name);
         Mat4 bind; std::memcpy(bind.data(), sb.bind, sizeof(bind));
         // sb.bind IS ALREADY the inverse-bind (model->bone): skin = invBind * boneWorld. Do NOT invert it.
-        Mat4 skin = (it != boneIdx.end()) ? Mat4Mul(bind, world[it->second]) : kIdentity;
+        Mat4 skin = kIdentity;
+        if (it != boneIdx.end()) skin = Mat4Mul(bind, world[it->second]);
+        else if (extra) {
+            auto ex = extra->find(sb.name);
+            if (ex != extra->end()) skin = Mat4Mul(bind, ex->second);
+        }
         for (const BoneWeight& bw : sb.weights) {
             if (bw.vertex >= nv) continue;
             float vx = m.positions[bw.vertex*3], vy = m.positions[bw.vertex*3+1], vz = m.positions[bw.vertex*3+2];
@@ -286,6 +337,13 @@ std::vector<float> SkinModelW(const Model& m, const Scene& sc, const std::vector
 
 std::vector<float> SkinModel(const Model& m, const Scene& sc, const Pose& pose) {
     return SkinModelW(m, sc, ResolveBoneWorlds(sc, pose));
+}
+
+// A node's own track: "BASE", else its first transform track.
+static const Anim* OwnTrack(const std::vector<Anim>& anims) {
+    for (const Anim& a : anims) if (a.hasTransform && a.name == "BASE") return &a;
+    for (const Anim& a : anims) if (a.hasTransform) return &a;
+    return nullptr;
 }
 
 // Local animated matrix of a MODEL. Animation goes by clip NAME in model.anims
@@ -312,6 +370,8 @@ NodeResolver MakeNodeResolver(const Scene& scene, const Pose& pose, bool animate
     uint32_t tick = pose.tickA;
     bool loop = pose.loopA;
     std::string clipName = pose.clipA;
+    const Scene* scenePtr = &scene;              // the lambda copies by value: no Scene copy
+    auto bonePose = std::make_shared<Pose>(pose);
     auto cache = std::make_shared<std::unordered_map<std::string, std::optional<Mat4>>>();
 
     auto self = std::make_shared<std::function<std::optional<Mat4>(const std::string&, int)>>();
@@ -323,13 +383,42 @@ NodeResolver MakeNodeResolver(const Scene& scene, const Pose& pose, bool animate
         auto bit = boneIdx->find(name);
         if (bit != boneIdx->end() && !boneWorlds->empty()) {
             w = (*boneWorlds)[bit->second];
+            // A bone chain hung from a MODEL (counter_guillotine_l: the disc's
+            // cs_hand_dummy is a child of the gauntlet piece counter_guillotine)
+            // came out of ResolveBoneWorlds as a root - its local alone, the disc
+            // 166 units off the arm. Carry it with that model when the top bone
+            // has a track (its world is then only its local).
+            const Bone* top = &scenePtr->bones[bit->second];
+            for (int g = 0; g < 64; ++g) {
+                auto pit = boneIdx->find(top->parent);
+                if (pit == boneIdx->end()) break;
+                top = &scenePtr->bones[pit->second];
+            }
+            if (modelByName->count(top->parent) && SampleBonePose(*top, *bonePose))
+                if (std::optional<Mat4> pw = (*self)(top->parent, depth + 1)) w = Mat4Mul(*w, *pw);
         } else {
             auto mit = modelByName->find(name);
             if (mit != modelByName->end()) {
                 const Model& m = *mit->second;
-                Mat4 local = animateModels ? SampleModelLocal(m, clipName, tick, loop) : [&]{ Mat4 m16; std::memcpy(m16.data(), m.matrix, sizeof(m16)); return m16; }();
-                std::optional<Mat4> p = m.parent.empty() ? std::nullopt : (*self)(m.parent, depth + 1);
-                w = p ? Mat4Mul(local, *p) : local;
+                // A piece without the current clip keeps its own BASE local
+                // under its (animated) parent, so it moves with it - like the
+                // bones already do. The static matrix is absolute in weapon
+                // files: chaining it under the parent again tore pieces off
+                // (deathscythe_normal has no GR* clip: in GR000 idle the blade
+                // left the animated handle; in dodge both have 000xx and it
+                // assembled). Only a piece with no track at all uses it, as is.
+                const Anim* clip = nullptr;
+                if (animateModels && !clipName.empty())
+                    for (const Anim& x : m.anims) if (x.name == clipName && x.hasTransform) { clip = &x; break; }
+                const Anim* own = clip ? nullptr : OwnTrack(m.anims);
+                if (animateModels && (clip || own)) {
+                    const Mat4 local = clip ? ComposeTRS(*clip, tick, loop) : BuildTRS(own->initT, own->initR, own->initS);
+                    std::optional<Mat4> p = m.parent.empty() ? std::nullopt : (*self)(m.parent, depth + 1);
+                    w = p ? Mat4Mul(local, *p) : local;
+                } else {
+                    Mat4 m16; std::memcpy(m16.data(), m.matrix, sizeof(m16));
+                    w = m16;
+                }
             }
         }
         (*cache)[name] = w;
@@ -362,6 +451,12 @@ void SkinModel(const Model& m, const Scene& sc, const Pose& pose, std::vector<Ve
     out.resize(flat.size() / 3);
     for (size_t i = 0; i < out.size(); ++i) out[i] = { flat[i*3], flat[i*3+1], flat[i*3+2] };
 }
+void SkinModel(const Model& m, const Scene& sc, const Pose& pose, const Pose* lowerPose,
+               const std::unordered_map<std::string, Mat4>& extra, std::vector<Vec3>& out) {
+    std::vector<float> flat = SkinModelW(m, sc, ResolveBoneWorlds(sc, pose, nullptr, nullptr, lowerPose), &extra);
+    out.resize(flat.size() / 3);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = { flat[i*3], flat[i*3+1], flat[i*3+2] };
+}
 void SkinModel(const Model& m, const Scene& sc, const Pose& pose, const Pose* lowerPose, std::vector<Vec3>& out) {
     if (!lowerPose) { SkinModel(m, sc, pose, out); return; }
     std::vector<float> flat = SkinModelW(m, sc, ResolveBoneWorlds(sc, pose, nullptr, nullptr, lowerPose));
@@ -373,7 +468,42 @@ void SkinModel(const Model& m, const Scene& sc, const Pose& pose, const Pose* lo
 // while some legacy weapons (notably dragonmachinegun) store a child relative
 // to its model parent. Pick the interpretation whose piece remains near the
 // resolved parent; this preserves both layouts.
+bool TrackWorld(const Scene& sc, const std::string& name, Mat4& out, bool passContainer) {
+    Mat4 acc{}; acc[0] = acc[5] = acc[10] = acc[15] = 1.f;
+    std::string cur = name;
+    for (int depth = 0; depth < 64; ++depth) {
+        const std::vector<Anim>* anims = nullptr; const std::string* parent = nullptr;
+        for (const Model& m : sc.models) if (m.name == cur) { anims = &m.anims; parent = &m.parent; break; }
+        if (!anims) for (const Bone& b : sc.bones) if (b.name == cur) { anims = &b.anims; parent = &b.parent; break; }
+        if (!anims) { out = acc; return depth > 0; }   // reached the scene root (file name / "")
+        const Anim* t = OwnTrack(*anims);
+        if (!t) {
+            if (!passContainer) return false;
+            // BONESYSTEM (the .scn container) has no track and sits at the
+            // identity: pass through it. Mounts under it (plasma_goldengibson,
+            // counter_goldenchain_r) otherwise had no track place at all.
+            const float* M = nullptr;
+            for (const Bone& b : sc.bones) if (b.name == cur) { M = b.matrix; break; }
+            if (!M) for (const Model& m : sc.models) if (m.name == cur) { M = m.matrix; break; }
+            bool ident = M != nullptr;
+            for (int k = 0; ident && k < 16; ++k) ident = std::fabs(M[k] - ((k % 5 == 0) ? 1.f : 0.f)) < 1e-4f;
+            if (!ident) return false;
+            cur = *parent;
+            continue;
+        }
+        acc = Mat4Mul(acc, BuildTRS(t->initT, t->initR, t->initS));
+        cur = *parent;
+    }
+    return false;
+}
+
 void WeaponMountInverse(const Scene& sc, const Bone& mount, float invOut[16]) {
+    // The mount's place comes from its own track chain when it has one (same
+    // as the static matrix in most files); the bounds rule below still
+    // decides whether its translation is usable (counter_crow_l's fist
+    // depends on the rotation-only case).
+    Mat4 tw;
+    const bool haveTrack = TrackWorld(sc, mount.name, tw);
     float lo[3]={1e9f,1e9f,1e9f}, hi[3]={-1e9f,-1e9f,-1e9f};
     for (const Model& m : sc.models)
         for (const Vec3& v : m.vertices) {
@@ -382,12 +512,18 @@ void WeaponMountInverse(const Scene& sc, const Bone& mount, float invOut[16]) {
                            v.x*m.matrix[2]+v.y*m.matrix[6]+v.z*m.matrix[10]+m.matrix[14] };
             for (int k=0;k<3;++k) { lo[k]=(std::min)(lo[k],w[k]); hi[k]=(std::max)(hi[k],w[k]); }
         }
-    const float* t = mount.matrix + 12;
-    bool inBounds = !sc.models.empty() &&
-                    t[0] >= lo[0]-1.f && t[0] <= hi[0]+1.f &&
-                    t[1] >= lo[1]-1.f && t[1] <= hi[1]+1.f &&
-                    t[2] >= lo[2]-1.f && t[2] <= hi[2]+1.f;
     Mat4 mountM; std::memcpy(mountM.data(), mount.matrix, sizeof(mountM));
+    if (haveTrack) mountM = tw;
+    const float* t = mountM.data() + 12;
+    // A dummy authored just beside the grip (counter_sword_r: ~6 units off
+    // the blade's bounds) is still the grip; only a dummy far outside the
+    // weapon (dragonmachinegun: 32 units past it) lives in another space.
+    const float dx = hi[0]-lo[0], dy = hi[1]-lo[1], dz = hi[2]-lo[2];
+    const float margin = (std::max)(15.f, 0.1f * std::sqrt(dx*dx + dy*dy + dz*dz));
+    bool inBounds = !sc.models.empty() &&
+                    t[0] >= lo[0]-margin && t[0] <= hi[0]+margin &&
+                    t[1] >= lo[1]-margin && t[1] <= hi[1]+margin &&
+                    t[2] >= lo[2]-margin && t[2] <= hi[2]+margin;
     if (inBounds) { Mat4 inv = Mat4InvAffine(mountM); std::memcpy(invOut, inv.data(), sizeof(float)*16); return; }
     Mat4 rot = mountM; rot[12]=rot[13]=rot[14]=0.f;
     Mat4 inv = Mat4InvAffine(rot);
@@ -417,6 +553,8 @@ void ResolveWeaponPieceWorlds(const Scene& sc, std::vector<std::array<float,16>>
 
     for (size_t i = 0; i < sc.models.size(); ++i) {
         const Model& m = sc.models[i];
+        Mat4 tw;
+        if (TrackWorld(sc, m.name, tw)) { out[i] = tw; continue; }   // own-track chain wins
         Mat4 flat; std::memcpy(flat.data(), m.matrix, sizeof(flat));
         Mat4 chosen = flat;
         auto parent = byName.find(m.parent);

@@ -27,5 +27,10 @@ std::optional<int> TypeFromSuffix(const std::string& resourcesPath, const std::s
 // Bone the weapon's `sceneIndex` piece attaches to for weapon `type`.
 // idle = holstered (back/waist) instead of in-hand. Returns empty if not found.
 std::string AttachBone(const std::string& resourcesPath, int type, int sceneIndex, bool idle);
+// link of that piece: 0 = CWeapon::LoadWeaponModel (hangs by its Wea_Dummy,
+// hand <-> holster), 1 = CWeapon::LoadAttachWeaponModel (the whole SCN root
+// hierarchy hangs from the bone as authored - fists, forearm parts, cards).
+// -1 if the table has no entry.
+int AttachLink(const std::string& resourcesPath, int type, int sceneIndex);
 
 }  // namespace data

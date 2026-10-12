@@ -5,10 +5,13 @@
 #include "net/proud_client.h"
 #include "gui/xui.h"
 #include "scn/scn.h"
+#include "seq/seq.h"
 #include "anim/anim_controller.h"
 #include "anim/actorstates.h"
 #include "lua/lua_weapon_fire.h"
 #include "world/movement.h"
+#include "game/actor_fsm.h"
+#include "game/actor_input.h"
 #include "seq/seq.h"
 #include "seq/seq_player.h"
 #include <vector>
@@ -87,23 +90,70 @@ struct BgInfo {
     std::vector<std::string> bgm;       // [BGM] bgm_N playlist
 };
 
+#include "net/mp_client.h"
+
 struct WorldState : IScene {
     std::vector<BgInfo> maps;           // every bginfo-*.ini found (ESC map picker)
     int   mapIdx  = -1;                 // currently loaded entry in `maps`
-    bool  mapMenu = false;              // ESC overlay open
+    bool  mapMenu = false;              // ESC overlay open (also shown when the game starts)
+    int   menuPage = 0;                 // 0 = main (online/solo, maps, wardrobe...), 1 = maps, 2 = wardrobe
+    int   mainSel = 0;                  // highlighted main-menu row
+    int   settingsSel = 0;              // ESC > Settings: highlighted row
+    bool  displayApplied = false;       // config.json resolution/display applied once at start
+    bool  mpOnline = false;             // chosen in the menu: "Jugar en linea" / "Jugar solo"
+    // Wardrobe (like S4Web2's equip panels): every item.x7 costume whose .scn exists,
+    // per sex and slot (hair, face, body, leg, hand, foot). Entry 0 = the default 00_<sex>_<slot>.
+    // Slots: hair, face, body, leg, hand, foot, acc. file may list several
+    // node .scn joined by '|' (accessory bundles), "" = nothing worn.
+    // seqs: item.x7 <sequence node_nameN file_nameN> - effects hung from a
+    // node of the item's own .scn while it is worn (eye glows, auras...).
+    struct CostumeItem { std::string name, file, icon; std::vector<std::pair<std::string, std::string>> seqs; };
+    std::vector<CostumeItem> costumeItems[2][8];
+    bool  costumeBuilt = false;
+    // Inventory page (S4 layout): boxes 0..10 = HAIR FACE ACC PET | TOP LEGS HANDS FEET | WEAPON 1..3.
+    int   invBox = 4, invSel[11] = {}, invTop = 0, invHover = -1;
+    float invPreviewYaw = 0.f;          // character preview turn (drag with the mouse)
+    int   invDragX = -1;
+    bool  lmbPrev = false;
+    int   scrW = 1280, scrH = 720;      // last render size, for mouse hit tests
+    std::map<std::string, std::string> weaponIcons;   // weapon states -> item.x7 icon_image
+    // Every weapon item of item.x7 (inventory grid), like the clothes.
+    // category: 0 melee 1 rifle 2 heavy 3 sniper 4 sentry 5 thrown 6 special
+    // (item_key 2000000 + 10000 * category); -1 = a Lua type with no item.
+    struct WeaponItem { std::string name, icon, scn, states; int category = -1; };
+    std::vector<WeaponItem> weaponItems;
+    int   invWeaponFilter = -1;         // inventory weapon grid: -1 = all, else a category
+    std::vector<int> InvWeaponView() const;   // weaponItems indices passing the filter
+    struct UiRect { int x = 0, y = 0, w = 0, h = 0;
+                    bool Hit(int px, int py) const { return px >= x && py >= y && px < x + w && py < y + h; } };
+    void  InvLayout(UiRect boxes[12], UiRect& panel, UiRect& grid) const;
+    int   InvGridCount() const;
+    int   InvEquippedIndex(int box) const;
+    void  InvEquip(int index);
+    void  InvSelectBox(int box);
+    bool  MouseClient(int& mx, int& my) const;
+    void  BuildCostumeList();
+    void  ReloadCostume();              // re-reads the 6 parts after a wardrobe change, saves and sends it
+    std::string CostumeString() const;  // {"gender":..,"hair":..,...} sent to the server as 'equip'
+    // Other players' looks: parts per distinct equip string, skeleton per sex.
+    struct PeerLook { bool female = false; std::vector<scn::Scene> parts; };
+    std::map<std::string, PeerLook> peerLooks;
+    scn::Scene peerSkel[2];
+    bool  peerSkelLoaded[2] = { false, false };
     int   menuSel = 0;                  // highlighted row
     int   menuTop = 0;                  // first visible row (scroll)
     int   bgmIndex = 0;
-    bool  animMenu = false;             // F3: ajuste de animacion en vivo (como el menu del cliente JS)
-    int   animSel = 0;                  // fila seleccionada del menu de animacion
     // F4: selector de armas. Una entrada por NormalState_<X> del lua, emparejada
     // a un .scn de model/weapon por coincidencia de nombre (igual que el cliente JS).
     struct WeaponEntry { std::string states, scn; };
     std::vector<WeaponEntry> weaponList;
     bool  wpnMenu = false;
     int   wpnSel = 0, wpnTop = 0;
+    int   wpnTargetSlot = 0;            // F4 loadout editor: slot (0..2) that Enter fills
     void  BuildWeaponList();
     void  EquipEntry(int index);
+    void  LoadCharacterBody(bool asFemale);   // <sex>_bip + 00_<sex>_* parts (F7 toggles)
+    bool  female = false;
     std::vector<scn::Scene> map;        // static map meshes (visible geometry)
     std::vector<CollTri> collTris;      // precomputed world-space collision triangles
     scn::Scene character;               // male_bip skeleton + anims
@@ -112,6 +162,9 @@ struct WorldState : IScene {
     float charYaw = 0.f;                // character facing = camera yaw (S4: heading follows aim)
     float camYaw = 0.f;                 // camera look yaw (mouse + arrows)
     float camPitch = 0.25f;             // camera pitch (radians)
+    float lookYaw = 0.f, lookPitch = 0.f;   // hold Q: free look around the character (camera only), eases back on release
+    float camSideCur = 1.f;             // -1 left .. +1 right shoulder, eased toward camSideTarget
+    float camSideTarget = 1.f;          // Z toggles the over-the-shoulder side
     float camDist = 500.f;              // third-person distance behind (client depthoffset=500)
     float camEye[3] = { 0, 0, 0 };      // smoothed camera position (spring-damper follow)
     float camVel[3] = { 0, 0, 0 };      // camera velocity (SmoothDamp state)
@@ -126,7 +179,6 @@ struct WorldState : IScene {
     world::MovementController moveCtrl;   // ported 1:1 from C:\S4Web2\world.html (moveXZ/hitWall/jump/dodge)
     unsigned lastTick = 0;              // for frame-independent dt
     float lastDt = 0.016f;              // dt from last OnUpdate (for camera smoothing)
-    bool  spaceWasDown = false;         // Space edge (dodge/jump on fresh press)
     float dodgeVelX = 0.f, dodgeVelZ = 0.f, dodgeTimeLeft = 0.f;   // world::MovementController dodge state
     float wallJumpDelayLeft = 0.f, wallJumpTimeLeft = 0.f;
     float wallJumpVelX = 0.f, wallJumpVelZ = 0.f;
@@ -135,12 +187,26 @@ struct WorldState : IScene {
     unsigned dodgeUntil = 0;            // dodge VELOCITY burst window (dodge_dodge_time 0.225s)
     unsigned dodgeClipUntil = 0;        // dodge CLIP plays fully until here (= clip duration); jump cancels
     std::string dodgeClip;              // current dodge animation clip
-    unsigned char prevWASD = 0;         // previous WASD state (double-tap edge detect)
-    unsigned char lastTapKey = 0;       // which direction was last tapped (same-key double-tap)
-    unsigned lastTapTime = 0;           // last direction fresh-press (double-tap window)
-    int pendingDodgeDir = 0;             // -1=A, +1=D, remembered until Space
-    unsigned pendingDodgeTime = 0;       // A/D -> Space is accepted for 1 second
-    bool  running = false;              // double-tapped -> run (walk otherwise)
+    // Game::CUserInput + the actor state machine, reconstructed from the
+    // beta client (src/game). They replace the hand-written double-tap /
+    // A-then-Space detection and the polled "wanted state" selection.
+    game::UserInput userInput;
+    game::ActorFsm  fsm;
+    bool  fsmBound = false;
+    // Set by the FSM's OnEnter for this frame's movement tick.
+    bool  fsmStartJump = false;
+    int   fsmStartDodge = 0;            // -1 left, +1 right, 0 none
+    bool  fsmTryWallJump = false;
+    bool  fsmEntered = false;           // a ChangeState happened this frame (anim restart)
+    bool  fsmKillRise = false;
+    bool  fsmCancelDodge = false;       // left DODGE for another state: stop the dodge slide now
+    bool  fsmCancelWallJump = false;    // attack started mid-air: stop the wall-jump flight
+    uint32_t fsmNowMs = 0;              // this frame's input/FSM clock (for the [fsm]/[input] log)          // FASTRUN entered while rising: drop the jump's upward speed
+    bool  fsmCounterRows = false;
+    // CWeapon Draw/Holster state: true = link=0 pieces sit on their
+    // idleAttach node (Spine_Dummy / Gun_Dummy) instead of the hand.
+    bool  weaponHolstered = false;      // counter-sword guard rows installed on USE_WEAPON2
+    anim::ActorState animBaseState = anim::STATE_NORMAL;  // last non-attack state (AnimController input)
     unsigned bounceUntil = 0;           // wall-bounce clip active until this tick
     unsigned airLockUntil = 0;          // after a wall-jump: keep the back+up momentum (no air-control) until here
     unsigned landUntil = 0;             // LANDING clip (00003) window after touching down from a real fall
@@ -166,6 +232,7 @@ struct WorldState : IScene {
     struct WeaponRenderPart {
         scn::Scene scene;
         float invMount[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        std::string mountName;          // link=0 mount dummy (empty for link=1 pieces)
         std::vector<std::array<float,16>> pieceWorlds;
         std::string attackBone;
         std::string idleBone;
@@ -173,6 +240,75 @@ struct WorldState : IScene {
         int sceneIndex = 0;
     };
     std::vector<WeaponRenderPart> weaponParts;
+    // Other players' weapons (mp 'equip' / roster: weapon .scn + its states):
+    // the pieces, mount inverse and attach bones built the same way as ours,
+    // without the per-skin special cases. Keyed by "file|states".
+    std::unordered_map<std::string, std::vector<WeaponRenderPart>> peerWeapons;
+    const std::vector<WeaponRenderPart>& PeerWeaponParts(const std::string& file, const std::string& states);
+    // Guns (weaponAnim.isGun): hold the left click to fire at the item's
+    // rate_of_fire, magazine_capacity rounds, R / empty magazine reloads
+    // (weapon_type_reload_info.x7 reload_period).
+    float gunRate = 0.f, gunRange = 3000.f;
+    int gunMag = 0, gunAmmo = 0;
+    unsigned gunReloadMs = 2000, gunNextShotAt = 0, gunReloadEnd = 0, gunFireStart = 0;
+    bool gunFiring = false, gunReloading = false, gunRWasDown = false;
+    unsigned gunPrevShotAt = 0;              // the shot before - its pose is blended out of on a restart
+    unsigned gunLastShotAt = 0;              // game clock (tnow) of the last shot - the fire pose restarts with it
+    // The gun's own STATE:InitLua (weapon_lua.x7 left_attack weapon=, e.g.
+    // StandardClassicRifle: 260, 40, -40, 250, 0, 666, 1, dry sound):
+    // fHeightOffset / fSideOffset0 / fSideOffset1 / fFrontOffset = where the
+    // shot leaves the actor, uiAnimPlayTime = the fire clip's length per shot.
+    float gunHeight = 0.f, gunSide0 = 0.f, gunSide1 = 0.f, gunFront = 0.f, gunAnimMs = 0.f;
+    bool gunHasOrigin = false;
+    std::string weaponCrosshair;   // item <resources crosshair_file> (xhair_assaultrifle -> image/weapon/xhair_assaultrifle_1.png)
+    std::string gunReloadSound;
+    float gunMuzzle[3] = { 0.f, 0.f, 0.f };   // world place of the weapon's fire node, last frame
+    bool gunMuzzleValid = false;
+    void FireGunShot(unsigned tnow);
+    // Online combat: HP (starts at 100), hits sent through the relay server
+    // (mpserver 'hit' -> target gets 'hurt'). The server only relays.
+    float myHp = 100.f, myHpMax = 100.f;
+    float camEyeNow[3] = { 0, 0, 0 }, camAtNow[3] = { 0, 0, 1 };   // this frame's camera (HP bars over heads)
+    std::vector<std::array<float, 3>> spawnPoints;   // the map's spawn_pos markers (respawn after dying)
+    unsigned hurtFlashUntil = 0;
+    void HitPeersInCone(float range, float dmg, float knock);   // melee: in front of the character
+    // Bullets: the nearest other player the ray reaches before maxT (the wall).
+    bool PeerAlongRay(const float org[3], const float dir[3], float maxT, int& peerId, float& tHit);
+    // The gun's rays from its Lua fire function: every Attack's MAKERAY
+    // direction (revolver: 4 rays per shot), plus its AddProjectileOffset
+    // pattern (smash rifle: one offset per shot, cycling). Local x/y per unit
+    // forward, x < 0 = right (script comments: -0.015 "right right").
+    struct GunRay { float x = 0.f, y = 0.f; std::vector<float> off; float pushMs = 0.f, pushSpeed = 0.f, pushAccel = 0.f; };
+    // A shot that hits a wall point-blank pushes the shooter back with that
+    // attack's AddPushCondition (shotgun 3000 + 7x750, revolver 4x1125), moved
+    // like the client's AttackEffect::CPush (beta sub_88BCD0): speed += accel*dt
+    // each step, displaced along the push direction, for its time.
+    struct SelfPush { float dirX = 0.f, dirZ = 0.f, speed = 0.f, accel = 0.f, msLeft = 0.f; };
+    std::vector<SelfPush> selfPushes;
+    std::vector<GunRay> gunRays;
+    unsigned gunShotIndex = 0;
+    struct GunTracer { float a[3], b[3]; unsigned born; };   // bullet streak, muzzle -> impact (no beam .seq)
+    // The weapon's tracer .seq (SetGunTracerAttachNode arg 2) CActLightning
+    // nodes: a beam from the gun's fire node to where the shot landed.
+    struct BeamNode { seq::Node::Beam beam; uint32_t begin = 0, end = 0; };
+    std::vector<BeamNode> gunBeamNodes;
+    uint32_t gunBeamDuration = 0;
+    struct GunBeam { float b[3]; unsigned born; };
+    std::vector<GunBeam> gunBeams;
+    // Other players' shots (mp 'shot'): their beams start at their muzzle, and
+    // use the beam nodes of their own tracer .seq.
+    struct PeerBeam { float a[3], b[3]; unsigned born; std::string tracer; };
+    std::vector<PeerBeam> peerBeams;
+    std::unordered_map<std::string, std::pair<std::vector<BeamNode>, uint32_t>> beamSeqCache;   // tracer .seq -> beam nodes, duration
+    const std::pair<std::vector<BeamNode>, uint32_t>& BeamNodesOf(const std::string& seqPath);
+    void PlayPeerShot(const mp::Shot& s);
+    std::vector<GunTracer> gunTracers;
+    std::vector<scn::Scene> weaponWornParts;   // Iron Boots: worn on the feet, skinned like a costume part
+    unsigned WornSlotMask() const {   // costume slots the worn weapon replaces
+        unsigned m = 0;
+        for (const scn::Scene& w : weaponWornParts) if (w.costumeSlot >= 0) m |= 1u << w.costumeSlot;
+        return m;
+    }
     std::vector<std::string> weaponAdjustBones;
     struct WeaponBoneOverride { std::string weapon; int part = 0; std::string bone; };
     std::vector<WeaponBoneOverride> weaponBoneOverrides;
@@ -190,6 +326,43 @@ struct WorldState : IScene {
     // Stay at 1.0 (no penalty) for any attack whose real Lua function name
     // isn't found under the StandardXStandAttack_Weak/Strong/Strong1 convention.
     float atkMoveSpeedRateWeak = 1.f, atkMoveSpeedRateStrong = 1.f, atkMoveSpeedRateStrong1 = 1.f;
+    // STATE:SetMoveBoxMultiplier of each swing: the attack's own animated
+    // MoveBox delta is scaled by this (CAttackState::Tick, sub_896290).
+    float atkMoveBoxWeak = 1.f, atkMoveBoxStrong = 1.f, atkMoveBoxStrong1 = 1.f;
+    // STATE:InitLua(normalMs, delayMs, ...) of each swing: the attack state
+    // lasts normal + delay, and ApplyAnim fits the clip to normalMs. 0 = the
+    // swing's Lua was not found (falls back to the clip's own length).
+    float atkNormalMsWeak = 0.f, atkNormalMsStrong = 0.f, atkNormalMsStrong1 = 0.f;
+    bool  atkUseMoveBoxWeak = false, atkUseMoveBoxStrong = false, atkUseMoveBoxStrong1 = false;
+    float atkDelayMsWeak = 0.f, atkDelayMsStrong = 0.f, atkDelayMsStrong1 = 0.f;
+    // Scene-level fade between animation SOURCES (locomotion controller,
+    // a swing, each right-click/jump-attack phase, a swing restarted on the
+    // same clip). Same rule as CAnimationController1::SetAnimation: the
+    // outgoing pose fades over (its blendOut + the new row's blendIn) ticks,
+    // ticks = ms * 4.8 (sub_731AC0). A change in the middle of a fade starts
+    // from the pose on screen.
+    std::string srcKey;
+    int srcBlendOut = 0;
+    bool srcFadeLower = true;   // false: attack -> attack, the legs keep their own layer
+    // Legs during a grounded swing (the state's lowerPartStateSet). Own clock
+    // and own cross-fade: the walk rows are RESET_FALSE, so the leg cycle runs
+    // on across swings instead of restarting with each one.
+    std::string atkLegClip, atkLegPrevClip;
+    float atkLegClock = 0.f, atkLegPrevClock = 0.f;
+    float atkLegFadeTicks = 0.f, atkLegFadeElapsed = 0.f;
+    int atkLegBlendOut = 0;
+    bool atkLegLoop = true, atkLegPrevLoop = true;
+    unsigned atkLegLastMs = 0, atkLegAttackStart = 0;
+    bool atkLegCarried = false;
+    bool srcFadeActive = false;
+    unsigned srcFadeStart = 0;
+    float srcFadeTicks = 0.f;
+    scn::Pose srcFadeUp, srcFadeLow;
+    scn::Pose shownPose, shownLower;
+    bool shownLowerActive = false;
+    // SetDrop's horizontal part, rotated to world when the drop fires; carried
+    // until landing (the CS jump attack flies forward-down at -6000 Z).
+    float weapon2DropVelX = 0.f, weapon2DropVelZ = 0.f;
     // STATE:SetHitStop(a,b)'s first value (ms) - how long the WHOLE SIM
     // near-freezes on this swing's impact frame, applied unconditionally (no
     // hit detection against other actors yet, so every swing gets its own
@@ -228,6 +401,7 @@ struct WorldState : IScene {
     bool  rmbWasDown = false, rightHeld = false;
     unsigned rightHeldAt = 0, lastWeapon2At = 0;
     int weapon2Phase = 0;            // current row in weaponAnim.atkWeapon2's phase sequence
+    bool weapon2PeerHitDone = false;     // online: this right-click/jump action already hit-tested the peers
     unsigned weapon2PhaseStart = 0;  // when the current phase started (its own clock, RESET_TRUE)
     // Set on RMB press, cleared once the held/guard phase is reached AND the
     // button is no longer down - the wind-up phase(s) before that always play
@@ -239,30 +413,61 @@ struct WorldState : IScene {
     float weapon2MoveBoxX = 0.f, weapon2MoveBoxZ = 0.f;
     std::string weapon2MoveBoxClip;
     luaw::WeaponFireState weapon2Lua;
+    // STATE:AddSequence entries of each swing's Weapon_*.lua function, and the
+    // ones scheduled for the swing in progress (effect + its sound, fired
+    // startTime ms after the swing starts; dropped if the swing is cut).
+    std::vector<luaw::WeaponFireState::Sequence> atkSeqWeak, atkSeqStrong, atkSeqStrong1;
+    struct PendingSeq { unsigned atMs; std::string file, sound; };
+    std::vector<PendingSeq> pendingSeqs;
     luaw::WeaponFireState jumpAttackLua;
 
     // A single .seq effect currently playing at some world position (a swing's
     // particle burst, a muzzle flash, ...).
-    struct EffectNode { seq::ParticlePlayer player; std::string texFile; bool additive = false; };
+    struct EffectNode { seq::ParticlePlayer player; std::vector<seq::TexRef> textures; bool additive = false; };
     // A mesh a node loader hangs off the effect (the actual slash-arc/flash
     // model some effects use alongside their sparks). No transform animation
     // yet - it sits at the effect's spawn point for its whole lifetime.
-    struct EffectModel { scn::Scene model; };
+    struct EffectModel { scn::Scene model; uint32_t begin = 0, end = 0, fadeIn = 0, fadeOut = 0; bool loop = false; std::string anim; };
     struct ActiveEffect {
         std::vector<EffectNode> nodes;
         std::vector<EffectModel> models;
         uint32_t duration = 0;
-        float x = 0, y = 0, z = 0, yaw = 0;
+        float x = 0, y = 0, z = 0, yaw = 0, pitch = 0;
+        float localScale = 1.f, playbackRate = 1.f;
         unsigned startTick = 0;
+        // Hung off the actor's scene node (sub_7C50D0(seq, "", actorScene)):
+        // follows the actor's position and facing every frame.
+        bool followActor = true;
+        // Effect owned by a state (fastrun trail): restarted while the state
+        // lasts and removed when it ends. Empty = one-shot.
+        std::string tag;
+        // Costume effect: follows this node of a worn part (item.x7 <sequence>).
+        std::string attachNode;
+        std::string attachFallback;     // skeleton bone when the node is in neither the part nor the skeleton
+        // Recent placements (tick, effect matrix) - an AttachTarget particle
+        // is drawn from where the emitter was when it was born.
+        std::vector<std::pair<unsigned, std::array<float, 16>>> history;
     };
     std::vector<ActiveEffect> activeEffects;
-    bool seqEffectsEnabled = false;   // .seq particle/model effects off for now, still being tuned
-    void SpawnSeq(const std::string& relPath, float x, float y, float z, float yaw);
-    void DrawEffects(IRenderer* r, unsigned tnow);
+    bool seqEffectsEnabled = true;    // .seq particle/model effects (all 616 S10 .seq files parse)
+    void SpawnSeq(const std::string& relPath, float x, float y, float z, float yaw, const std::string& tag = std::string(),
+                  float localScale = 1.f, float playbackRate = 1.f, float pitch = 0.f);
+    // previewPlace/previewPose: draw only the worn-costume effects on the
+    // inventory preview character (no state changes to the live effects).
+    void DrawEffects(IRenderer* r, unsigned tnow, const float* previewPlace = nullptr, const scn::AnimPose* previewPose = nullptr);
+    void SpawnCostumeEffects();         // (re)starts the worn items' <sequence> effects
+    bool CostumeNodeWorld(const std::string& node, float out[16], const scn::AnimPose* pose = nullptr) const;   // character space
 
     void  EquipWeapon(int slot);
     void  EquipWeaponFile(const char* scnName, const char* states);
     scn::AnimPose curPose;              // pose produced by animCtrl this frame (used by OnRender)
+    // Online (server/mpserver.js): config.json "online" {enabled, server, id, nickname}.
+    mp::Client mpClient;
+    unsigned mpNextTryMs = 0, mpNextSendMs = 0;
+    std::string mpWeaponScn;            // .scn of the equipped weapon, sent with equip
+    void UpdateOnline(unsigned nowMs, float dt);
+    void DrawPeers(IRenderer* r);
+    void DrawWeaponParts(IRenderer* r, const scn::AnimPose& pose, const float* place, bool preview, const scn::AnimPose* lowerPose = nullptr);
     // Raw locomotion direction kept for the weapon SCN's own upper-body clips
     // (KN001..KN008, gun run poses, etc.). The character controller may be
     // playing a different clip name than the weapon scene.
@@ -277,10 +482,8 @@ struct WorldState : IScene {
     bool curLowerPoseActive = false;
     bool  didJump = false;             // true while airborne FROM a jump (JUMP vs FALL state)
     bool  jumpMoving = false;          // this jump took off while moving -> 00004 move-rise plays the WHOLE arc
+    bool  jumpHadDir = false;          // took off with any direction held (wall-jump eligible)
     int   dodgeDir = -1;               // active dodge direction (0 front/1 back/2 left/3 right; -1 = none)
-    bool  inAction = false;            // an action sequence (jump/fall/dodge) is latched
-    anim::ActorState actionState = anim::STATE_NORMAL;  // which action state is latched
-    anim::ActorStateMachine actorStateMachine; // CStateMachine-compatible transition core
     int lastAudioState = -1;
     std::string prevClip;               // outgoing clip during a cross-fade
     unsigned prevAnimStart = 0;         // when the outgoing clip started

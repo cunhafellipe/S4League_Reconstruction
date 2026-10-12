@@ -22,6 +22,7 @@
 #include "input/input.h"
 #include "net/config.h"
 #include "app/dbg.h"
+#include "app/focus.h"
 #include "audio/audio.h"
 #include <string>
 
@@ -33,7 +34,7 @@
 // Frame limiter: cap to a target fps with a hybrid sleep+spin (Kethen-style, like
 // fps.cpp) so movement/camera pace smoothly instead of running uncapped/jittery.
 // F2 cycles 60 -> 144 -> uncapped. timeBeginPeriod(1) makes Sleep(1) ~1ms accurate.
-static int g_targetFps = 60;
+static int g_targetFps = 144;
 static void LimitFrameRate() {
     if (g_targetFps <= 0) return;
     static LARGE_INTEGER freq = { 0 }, last = { 0 };
@@ -228,6 +229,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CLOSE:   DestroyWindow(hwnd); return 0;
+    case WM_SIZE:
+        if (wp != SIZE_MINIMIZED && LOWORD(lp) > 0 && HIWORD(lp) > 0 && g_host && g_host->engine && g_host->engine->renderer)
+            g_host->engine->renderer->RequestResize(LOWORD(lp), HIWORD(lp));
+        break;
     case WM_DESTROY:
         if (g_host && g_host->engine) g_host->engine->alive = false;
         PostQuitMessage(0);
@@ -239,7 +244,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             BYTE buf[64];
             if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz) {
                 RAWINPUT* ri = (RAWINPUT*)buf;
-                if (ri->header.dwType == RIM_TYPEMOUSE) {
+                // Mouse-look only while the game window is the focused one: raw
+                // input can still arrive with the game in the background.
+                if (ri->header.dwType == RIM_TYPEMOUSE && GameHasFocus()) {
                     const RAWMOUSE& m = ri->data.mouse;
                     if (m.usFlags & MOUSE_MOVE_ABSOLUTE) {
                         // Absolute mode (RDP/VM): deltas come from the last position,
@@ -271,6 +278,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                               DbgLog("[fps] cap -> %d", g_targetFps);
                           }
                           return 0;
+    case WM_MOUSEWHEEL:   if (GameHasFocus()) input::g.wheel += GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA; return 0;
     case WM_LBUTTONDOWN:  input::g.click = true; input::g.down = true;
                           input::g.mx = LOWORD(lp); input::g.my = HIWORD(lp); return 0;
     case WM_LBUTTONUP:    input::g.down = false; return 0;
@@ -280,7 +288,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // Window styles verbatim from FUN_00f163d0 (local_490).
-static constexpr DWORD kStyleWindowed   = 0x06CA0000;
+// 0x06CA0000 (the client's fixed window) + WS_THICKFRAME | WS_MAXIMIZEBOX:
+// resizable; the renderer resets its back buffer to the new client size.
+static constexpr DWORD kStyleWindowed   = 0x06CA0000 | WS_THICKFRAME | WS_MAXIMIZEBOX;
 static constexpr DWORD kStyleFullscreen = 0x86000000;
 static bool g_fullscreen = false;    // singleton+0x2c
 static int  g_width  = 1024;         // singleton+0x24
@@ -316,6 +326,7 @@ static HWND CreateGameWindow()
     rid.dwFlags     = 0;
     rid.hwndTarget  = hwnd;
     BOOL rawOk = RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    SetGameHwnd(hwnd);   // game input only while this window is focused (app/focus.h)
     DbgLog("[input] RegisterRawInputDevices -> %d (err=%lu) hwnd=%p", (int)rawOk, GetLastError(), (void*)hwnd);
     return hwnd;
 }

@@ -3,6 +3,9 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace scn {
 
@@ -13,6 +16,12 @@ static const uint32_t BONE_MAGIC        = 0x6D411AD1;
 static const uint32_t LIGHT_MAGIC       = 0xC3E8BE62;
 static const uint32_t BONE_SYSTEM_MAGIC = 0x5E74333F;
 static const uint32_t LINE_MAGIC        = 0xADEE38A2;
+static const uint32_t SPHERE_MAGIC      = 0x4F1C2440;
+
+static bool IsChunkMagic(uint32_t v) {
+    return v == MODEL_MAGIC || v == BOX_MAGIC || v == BONE_MAGIC || v == LIGHT_MAGIC ||
+           v == BONE_SYSTEM_MAGIC || v == LINE_MAGIC || v == SPHERE_MAGIC;
+}
 static const uint32_t VERSION_2         = 1045220557;   // 0x3E4CCCCD
 static const size_t   PADDING           = 1024;
 
@@ -42,7 +51,10 @@ static void ReadTransformKeys(Reader& r, std::vector<VecKey>& trans, std::vector
     for (uint32_t j = 0; j < k && !r.bad; ++j) { VecKey vk; vk.t = r.U32(); r.V3(vk.v); scale.push_back(vk); }
 }
 
-static void SkipVis(Reader& r) { uint32_t c = r.U32(); for (uint32_t k = 0; k < c && !r.bad; ++k) r.Skip(8); }
+static void ReadVis(Reader& r, std::vector<VisKey>& out) {
+    uint32_t c = r.U32();
+    for (uint32_t k = 0; k < c && !r.bad; ++k) { VisKey vk; vk.t = r.U32(); vk.v = r.F32(); if (k < 4096) out.push_back(vk); }
+}
 
 static std::vector<Anim> ReadModelAnims(Reader& r) {
     std::vector<Anim> anims;
@@ -56,7 +68,7 @@ static std::vector<Anim> ReadModelAnims(Reader& r) {
             r.V3(a.initS);
             ReadTransformKeys(r, a.trans, a.rot, a.scale);
         }
-        SkipVis(r);
+        ReadVis(r, a.vis);
         uint32_t mc = r.U32();   // morph keys (unused)
         for (uint32_t j = 0; j < mc && !r.bad; ++j) {
             r.U32();
@@ -82,7 +94,7 @@ static std::vector<Anim> ReadBoneAnims(Reader& r, bool versionFlag) {
             r.V3(a.initS);
             ReadTransformKeys(r, a.trans, a.rot, a.scale);
         }
-        SkipVis(r);
+        ReadVis(r, a.vis);
         anims.push_back(std::move(a));
     }
     return anims;
@@ -166,8 +178,86 @@ static Model ParseModel(Reader& r, const Base& base) {
     return m;
 }
 
+// Re-links the parsed nodes the way the client builds the tree
+// (CSceneResource::Load sub_583270 -> per node sub_5833D0 -> sub_583540, beta):
+// nodes are read in FILE order, the first one (the SCENE header, named after
+// the file) becomes the root, and each later
+// node looks its parent up with root->FindNode(name) (sub_530F40: pre-order
+// DFS, first match) among the nodes already attached. So a duplicated name
+// resolves to the copy found first, and a parent that only appears LATER in
+// the file is not found. 124_weapon_bat has two Dummy002 and two IK Chain001,
+// and its first node IK Chain001 names IK Chain004 (read later) as parent:
+// linked by name alone that formed a loop and the bat came out giant.
+// A node whose parent the client would not find keeps its original parent
+// name: some files (zautumn_umbrella_*, erosion_ripper) name a scene
+// root other than their header and would vanish entirely.
+// Here: later duplicates get a unique name ("Dummy002#2") and every child's
+// parent string points at the node the client would have picked, so the rest
+// of the code (name based) sees the client's tree.
+struct NodeRef { int kind; size_t idx; };   // 0 model, 1 bone, 2 box
+static void LinkLikeClient(Scene& sc, const std::vector<NodeRef>& order, std::string rootName) {
+    const size_t n = order.size();
+    if (n < 2) return;
+    auto nameOf = [&](const NodeRef& r) -> std::string& {
+        if (r.kind < 0) return rootName;
+        return r.kind == 0 ? sc.models[r.idx].name : r.kind == 1 ? sc.bones[r.idx].name : sc.boxes[r.idx].name; };
+    std::string rootParent;
+    auto parentOf = [&](const NodeRef& r) -> std::string& {
+        if (r.kind < 0) return rootParent;
+        return r.kind == 0 ? sc.models[r.idx].parent : r.kind == 1 ? sc.bones[r.idx].parent : sc.boxes[r.idx].parent; };
+    bool dup = false, forward = false;
+    {
+        std::unordered_map<std::string, int> seen;
+        for (size_t i = 0; i < n; ++i) if (++seen[nameOf(order[i])] > 1) dup = true;
+        std::unordered_map<std::string, size_t> first;
+        for (size_t i = 0; i < n; ++i) first.emplace(nameOf(order[i]), i);
+        for (size_t i = 0; i < n; ++i) {
+            auto it = first.find(parentOf(order[i]));
+            if (it != first.end() && it->second >= i) forward = true;   // parent read later (or itself)
+        }
+    }
+    if (!dup && !forward) return;   // the plain name links already match the client
+
+    std::vector<std::string> names(n);
+    for (size_t i = 0; i < n; ++i) names[i] = nameOf(order[i]);
+    std::vector<std::vector<size_t>> kids(n);
+    std::vector<int> par(n, -1);
+    std::vector<bool> attached(n, false);
+    attached[0] = true;
+    for (size_t i = 1; i < n; ++i) {
+        const std::string& want = parentOf(order[i]);
+        // pre-order DFS from the root over what is attached so far
+        int found = -1;
+        std::vector<size_t> stack{ 0 };
+        while (!stack.empty() && found < 0) {
+            const size_t c = stack.back(); stack.pop_back();
+            if (names[c] == want) { found = (int)c; break; }
+            for (size_t k = kids[c].size(); k-- > 0; ) stack.push_back(kids[c][k]);
+        }
+        if (found >= 0) { par[i] = found; kids[found].push_back(i); attached[i] = true; }
+    }
+    // unique names for the later duplicates
+    std::unordered_map<std::string, int> count;
+    for (size_t i = 0; i < n; ++i) {
+        const int c = ++count[names[i]];
+        if (c > 1) names[i] += "#" + std::to_string(c);
+    }
+    for (size_t i = 0; i < n; ++i) nameOf(order[i]) = names[i];
+    for (size_t i = 1; i < n; ++i) {
+        if (par[i] > 0) { parentOf(order[i]) = names[par[i]]; continue; }   // under the root: keep its own spelling
+        if (par[i] == 0) continue;
+        // Not found because the parent is only read LATER (the bat's first node
+        // IK Chain001 -> IK Chain004): the client cannot link it either; hang
+        // it from the root instead of looping back through its own children.
+        const std::string& want = parentOf(order[i]);
+        for (size_t j = i; j < n; ++j)
+            if (nameOf(order[j]) == want || names[j] == want) { parentOf(order[i]) = names[0]; break; }
+    }
+}
+
 Scene ParseScn(const uint8_t* data, size_t size) {
     Scene sc;
+    std::vector<NodeRef> order{ { -1, 0 } };   // [0] = the SCENE header node (root)
     Reader r(data, size);
 
     sc.version = r.U32();
@@ -175,21 +265,33 @@ Scene ParseScn(const uint8_t* data, size_t size) {
     while (v != SCENE_MAGIC && !r.bad && guard++ < 64) v = r.U32();
     if (v != SCENE_MAGIC) { sc.error = "no SCENE magic"; return sc; }
 
-    r.Str(); r.Str(); r.U32(); r.Skip(16 * 4);
+    const std::string sceneName = r.Str(); r.Str(); r.U32(); r.Skip(16 * 4);
     uint32_t matrixEnd = r.U32();
-    uint32_t chunkCount = r.U32();
+    r.U32();   // chunk count - not trusted, see below
     if (matrixEnd >= VERSION_2) r.Str();
 
-    for (uint32_t i = 0; i < chunkCount && !r.bad; ++i) {
+    // Newer .scn files carry extra header data and chunk types this parser
+    // does not know, and their chunk count no longer matches what follows -
+    // walking exactly chunkCount chunks stopped at the first unknown block
+    // (e.g. 0x21000000) with 0 meshes loaded. Same as ItemManager's
+    // scn_geometry.js: skip forward to the next known chunk magic and read
+    // chunks until the end of the file.
+    while (!r.bad) {
+        while (r.o + 4 <= r.n && !IsChunkMagic(uint32_t(r.b[r.o]) | uint32_t(r.b[r.o+1]) << 8 |
+                                                uint32_t(r.b[r.o+2]) << 16 | uint32_t(r.b[r.o+3]) << 24))
+            ++r.o;
+        if (r.o + 4 > r.n) break;
         uint32_t type = r.U32();
         Base base = ReadBase(r);
         if (type == MODEL_MAGIC) {
             sc.models.push_back(ParseModel(r, base));
+            order.push_back({ 0, sc.models.size() - 1 });
         } else if (type == BONE_MAGIC) {
             Bone b; b.name = base.name; b.parent = base.parent;
             std::memcpy(b.matrix, base.matrix, sizeof(b.matrix));
             b.anims = ReadBoneAnims(r, base.mend >= VERSION_2);
             sc.bones.push_back(std::move(b));
+            order.push_back({ 1, sc.bones.size() - 1 });
         } else if (type == BONE_SYSTEM_MAGIC) {
             // BONESYSTEM is a real chunk with its own matrix (BaseChunk-only, no extra
             // fields) - added as a bone so parented chains (e.g. Frill) have a node to
@@ -197,6 +299,7 @@ Scene ParseScn(const uint8_t* data, size_t size) {
             Bone b; b.name = base.name; b.parent = base.parent;
             std::memcpy(b.matrix, base.matrix, sizeof(b.matrix));
             sc.bones.push_back(std::move(b));
+            order.push_back({ 1, sc.bones.size() - 1 });
         } else if (type == BOX_MAGIC) {
             // boxVer(u32) + localCenter(vec3) + axes(3x3 floats) + halfExtents(vec3) = 64
             // bytes total (scn_geometry.js skips all of it; captured here as scene-data
@@ -207,25 +310,37 @@ Scene ParseScn(const uint8_t* data, size_t size) {
             float hx=r.F32(), hy=r.F32(), hz=r.F32();
             bx.halfExtents = { hx, hy, hz };
             sc.boxes.push_back(std::move(bx));
+            order.push_back({ 2, sc.boxes.size() - 1 });
         } else if (type == LIGHT_MAGIC) {
             r.Skip(2*4 + 7*3*4);
         } else if (type == LINE_MAGIC) {
             uint32_t c = r.U32(); r.Skip(size_t(c) * 2 * 3 * 4);
-        } else {
-            break;
+        } else if (type == SPHERE_MAGIC) {
+            r.Skip(4 + 3 * 4 + 4);
         }
     }
 
-    for (const Bone& b : sc.bones)
-        for (const Anim& a : b.anims)
-            if (a.hasTransform && std::find(sc.animNames.begin(), sc.animNames.end(), a.name) == sc.animNames.end())
-                sc.animNames.push_back(a.name);
+    LinkLikeClient(sc, order, sceneName);
+
+    // Clip names any node of this scene can play. Models count too: in weapon
+    // SCNs the clip tracks often sit on the MODEL, not on its Wea_Dummy (the
+    // plasma sword's A0018/A0019 - the jump attack's reverse grip and blade
+    // extension - live on model "sword"; the dummy only has "SWORD"). Listing
+    // bones only made the weapon skip its own clip and stay in its normal
+    // grip while the body played the stab - the sword showed up upside down.
+    auto addName = [&](const Anim& a) {
+        if (a.hasTransform && std::find(sc.animNames.begin(), sc.animNames.end(), a.name) == sc.animNames.end())
+            sc.animNames.push_back(a.name);
+    };
+    for (const Bone& b : sc.bones)   for (const Anim& a : b.anims) addName(a);
+    for (const Model& m : sc.models) for (const Anim& a : m.anims) addName(a);
 
     for (const Model& m : sc.models)
         if (!m.positions.empty() && !m.indices.empty())
             sc.meshes.push_back(&m);
 
-    sc.ok = !sc.models.empty() || !sc.bones.empty();
+    // Spawn scenes (<map>_spawn.scn) hold only BOX markers; they are valid too.
+    sc.ok = !sc.models.empty() || !sc.bones.empty() || !sc.boxes.empty();
     return sc;
 }
 

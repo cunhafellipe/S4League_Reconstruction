@@ -25,11 +25,17 @@ enum ActorState {
     STATE_DODGE_RIGHT= 12,
     STATE_FASTRUN    = 21,
     STATE_IDLE       = 29,
-    // Combat states, not part of scn_anim.js (JS runs attacks through a separate
-    // Crossfader instead of AnimController) - kept as tags for scenes.cpp's own
-    // attack state machine, values matching the client's real ActorState enum.
-    STATE_USE_WEAPON1_WEAK   = 43,
-    STATE_USE_WEAPON1_STRONG = 44,
+    // Combat states. Numbered as the BETA binary numbers them (the builder
+    // sub_8339E0 creates them by index and names them through
+    // Game::GameSetting::Init*State). The S1 Lua constants differ here: S1 has
+    // no SKILL_SENSOR (34 in the beta) but adds USE_WEAPON2_WEAK/STRONG, which
+    // is why its USE_WEAPON1_WEAK/STRONG read 43/44 instead of 42/43.
+    STATE_USE_WEAPON1        = 40,
+    STATE_USE_WEAPON2        = 41,
+    STATE_USE_WEAPON1_WEAK   = 42,
+    STATE_USE_WEAPON1_STRONG = 43,
+    STATE_USE_WEAPON1_JUMP   = 44,
+    STATE_USE_WEAPON1_STRONG1= 45,
 };
 
 struct SAnimParam {

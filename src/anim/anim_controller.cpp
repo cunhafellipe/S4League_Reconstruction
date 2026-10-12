@@ -1,5 +1,6 @@
 // Ported 1:1 from C:\S4Web2\engine\scn_anim.js.
 #include "anim_controller.h"
+#include "app/dbg.h"
 #include "actorstates.h"
 #include <algorithm>
 #include <cmath>
@@ -37,32 +38,57 @@ static bool IsAction(ActorState s) {
 
 // Phases (ExitRule: 0 HOLD_LAST, 1 AFTER_MS, 2 TILL_APEX, 3 TILL_LAND)
 enum ExitRule { HOLD_LAST = 0, AFTER_MS = 1, TILL_APEX = 2, TILL_LAND = 3 };
-struct Phase { int slot; ExitRule rule; float ms; };
+// fitMs > 0: play the clip stretched to last exactly fitMs, the way
+// Game::Utility::CAnimParam::ApplyAnim does when a state passes it a duration
+// (speed = clipDurationMs * rate / duration). 0 = play at the authored rate.
+struct Phase { int slot; ExitRule rule; float ms; float fitMs = 0.f; };
 
-static const Phase kJumpMovePh[] = { {2, TILL_LAND, 0}, {4, AFTER_MS, 250} };
-static const Phase kJumpStatPh[] = { {1, TILL_APEX, 0}, {5, TILL_LAND, 0}, {3, AFTER_MS, 500} };
+// Jump rise phases are applied by CJumpState::SetPhase(1/3) (sub_7DBDD0)
+// with ApplyAnim's duration = its rise timer, jump_time: 00004 (startMs 600)
+// plays at 600/700 = 0.857, 00001 (no startMs -> its own 550 ms) at 0.786.
+// At 1.0 the 00004 somersault finished mid-air and the landing clip (00000,
+// LANDING_MOVE - also a somersault) then played a second full one; at the
+// client's speed the first one is still turning when the landing takes over.
+// fitMs is filled per call from AnimCtx::jumpTimeMs, see PhaseListFor.
 static const Phase kFallPh[]     = { {0, TILL_LAND, 0}, {1, AFTER_MS, 500} };
 // ActorState_Dodge (Lua) declares 6 params: FRONT/BACK/LEFT/RIGHT + DELAY_FRONT/
-// DELAY_BACK (slots 4,5) - FRONT/BACK are a 2-phase roll (clip -> recovery clip
-// in slot 4/5); LEFT/RIGHT are a SINGLE phase with blendOut=700 in
-// their SetAnim. The third numeric value is blendOut, not an action delay.
-static const Phase kDodgeFrontPh[] = { {0, AFTER_MS, 600}, {4, AFTER_MS, 500} };
-static const Phase kDodgeBackPh[]  = { {1, AFTER_MS, 600}, {5, AFTER_MS, 500} };
-static const Phase kDodgeLeftPh[]  = { {2, AFTER_MS, 1000} };
-static const Phase kDodgeRightPh[] = { {3, AFTER_MS, 1000} };
+// DELAY_BACK (slots 4,5). CDodgeState (sub_7E0D60 / sub_7E1380) applies them
+// stretched to its own timers:
+//   FRONT/BACK: the roll clip over dodge_dodge_time, then the DELAY clip over
+//               dodge_delay;
+//   LEFT/RIGHT: one clip over dodge_dodge_time + dodge_delay (the whole dodge).
+// The state itself ends with those timers (-> STANDBY), so the clip finishes
+// exactly as the dodge does instead of being cut part-way. Built per call
+// from AnimCtx because the timers are game_tempos.x7 data.
 // CBoundJumpState: authored 0.2s wall delay -> rise -> fall -> 0.2s landing.
 // A/B are alternatives selected by the native state; this controller uses A.
 static const Phase kBoundPh[]      = { {0, AFTER_MS, 200}, {1, TILL_APEX, 0}, {3, TILL_LAND, 0}, {5, AFTER_MS, 200} };
 
 static const Phase* PhaseListFor(ActorState s, const AnimCtx& c, int& count) {
-    if (s == STATE_JUMP) { if (c.jumpMoving) { count = 2; return kJumpMovePh; } count = 3; return kJumpStatPh; }
+    if (s == STATE_JUMP) {
+        static Phase jump[3];
+        if (c.jumpMoving) {
+            jump[0] = { 2, TILL_LAND, 0, c.jumpTimeMs };
+            jump[1] = { 4, AFTER_MS, 250 };
+            count = 2; return jump;
+        }
+        jump[0] = { 1, TILL_APEX, 0, c.jumpTimeMs };
+        jump[1] = { 5, TILL_LAND, 0 };
+        jump[2] = { 3, AFTER_MS, 500 };
+        count = 3; return jump;
+    }
     if (s == STATE_FALL) { count = 2; return kFallPh; }
     if (s == STATE_DODGE_LEFT || s == STATE_DODGE_RIGHT) {
-        int d = (c.dodgeDir >= 0 && c.dodgeDir <= 3) ? c.dodgeDir : 0;
-        if (d == 0) { count = 2; return kDodgeFrontPh; }
-        if (d == 1) { count = 2; return kDodgeBackPh; }
-        if (d == 2) { count = 1; return kDodgeLeftPh; }
-        count = 1; return kDodgeRightPh;
+        static Phase dodge[2];
+        const int d = (c.dodgeDir >= 0 && c.dodgeDir <= 3) ? c.dodgeDir : 0;
+        const float slide = c.dodgeSlideMs, delay = c.dodgeDelayMs;
+        if (d <= 1) {
+            dodge[0] = { d,     AFTER_MS, slide, slide };
+            dodge[1] = { d + 4, AFTER_MS, delay, delay };
+            count = 2; return dodge;
+        }
+        dodge[0] = { d, AFTER_MS, slide + delay, slide + delay };
+        count = 1; return dodge;
     }
     if (s == STATE_BOUNDJUMP) { count = 4; return kBoundPh; }
     count = 0; return nullptr;
@@ -73,7 +99,7 @@ static int Gate(ActorState s, const AnimCtx& c) {
     bool f = c.inZ > 0.5f, b = c.inZ < -0.5f, l = c.inX < -0.5f, r = c.inX > 0.5f;
     switch (s) {
         case STATE_NORMAL: case STATE_IDLE: return 0;
-        case STATE_FASTRUN: return 0;
+        case STATE_FASTRUN: return c.ironBoots ? 1 : 0;   // ANIMPARAMLIST_NORMAL 00068 / _IRON_BOOTS_NORMAL IB068
         case STATE_RUN:
             if (f && l) return 9; if (f && r) return 12; if (b && l) return 11; if (b && r) return 14;
             if (b) return 15; if (l) return 10; if (r) return 13; return 8;
@@ -122,13 +148,21 @@ const std::vector<SAnimParam>* AnimController::StateDef(ActorState s) const {
     return it != defs_.end() ? it->second : nullptr;
 }
 
-int AnimController::LoadFromLua(const LuaStates& lua, const char* weapon) {
+int AnimController::LoadFromLua(const LuaStates& lua, const char* weapon, const char* normalAs, const char* runAs) {
     if (!lua.loaded()) return 0;
     std::string w = (weapon && *weapon) ? weapon : "WeaponUnused";
 
     auto defs = BaseParams(lua.parsed());
     auto over = WeaponDefs(lua.parsed(), w);
     for (auto& kv : over) defs[kv.first] = kv.second;
+    auto useRows = [&](const char* as, const char* key) {
+        if (!as || !*as) return;
+        auto o = WeaponDefs(lua.parsed(), as);
+        auto it = o.find(key);
+        if (it != o.end() && !it->second.empty()) defs[key] = it->second;
+    };
+    useRows(normalAs, "NORMAL");
+    useRows(runAs, "RUN");
     LoadDefs(defs);
 
     WeaponAnim wa = ResolveWeaponAnim(lua.parsed(), w, &lua.attackMap(), &lua.attribMap());
@@ -158,8 +192,18 @@ scn::Pose AnimController::Update(ActorState state, const AnimCtx& rawCtx, float 
     if (ctx.blendMax >= 1e9f)  ctx.blendMax = blendCapMs;
     clockScale *= speedScale;
 
+    // Re-entry requested by a fresh, repeated action input: rewind the phase
+    // sequence and force the clip to be re-selected (with reset), which is
+    // what OnEnter does in the real engine. See Restart() in the header.
+    if (restart_) {
+        restart_ = false;
+        seqState_ = state; phaseIdx_ = 0; phaseClock_ = 0.f;
+        paramIdx_ = -1;
+    }
+
     const std::vector<SAnimParam>* def = StateDef(state);
     int idx;
+    float fitMs = 0.f;   // current action phase's ApplyAnim duration, if any
 
     if (IsAction(state)) {
         int n; const Phase* ph = PhaseListFor(state, ctx, n);
@@ -183,6 +227,7 @@ scn::Pose AnimController::Update(ActorState state, const AnimCtx& rawCtx, float 
         }
         const Phase& cur = ph[phaseIdx_ < n ? phaseIdx_ : n - 1];
         idx = cur.slot;
+        fitMs = cur.fitMs;
         if (phaseIdx_ < n - 1) actionBusy_ = true;
         else if (cur.rule == AFTER_MS) actionBusy_ = phaseClock_ < phaseMs(cur);
         else if (cur.rule == TILL_LAND) actionBusy_ = !ctx.grounded;
@@ -195,21 +240,66 @@ scn::Pose AnimController::Update(ActorState state, const AnimCtx& rawCtx, float 
 
     const SAnimParam* p = (def && idx >= 0 && idx < (int)def->size()) ? &(*def)[idx] : nullptr;
 
+    // A clip the skeleton does not carry must NOT be switched to. Several
+    // authored rows reference clips that simply are not in male_bip.scn
+    // (dodge FRONT "00038" / BACK "00041" and their DELAY rows "00039" /
+    // "00042" are 0/81 bones), and SampleBonePose() falls back to each bone's
+    // "BASE" track when the requested clip is missing on it. "BASE" IS on all
+    // 81 bones, so a fully-missing clip snaps every bone to BASE = T-pose for
+    // the whole phase - which is the "T for a second after dodging" bug.
+    //
+    // The real engine does the opposite: Game::IActor::SetAnimation1 logs
+    // "not found animation [AniName:%s ActorName:%s]" and leaves the previous
+    // animation playing. durOf() returns 0 for a clip the skeleton lacks, so
+    // that is the existence test here. Keeping the current clip reproduces the
+    // real behaviour; the BASE fallback stays intact for anchor/dummy bones,
+    // where the clip exists skeleton-wide but not on that particular bone.
+    if (p && ctx.durOf && p->clip != clipB_ && ctx.durOf(p->clip) <= 0.f)
+        p = nullptr;
+
     if (p && (state != state_ || idx != paramIdx_)) {
         if (!p->reset && clipB_ == p->clip) {
             state_ = state; paramIdx_ = idx;
         } else {
-            float fade = float((std::max)(prevBlendOut_, p->blendInMs));
+            // blendIn/blendOut come straight out of SetAnim and are in NATIVE
+            // TICKS, not milliseconds - same units as startMs, which phaseMs()
+            // above already divides by clockScale (clipTicks / 4.8). Without
+            // the same conversion a 500-tick blend ran as 500 ms (~5x too
+            // long): walking eased in instead of snapping, and every state
+            // change dragged. Converting keeps the RELATIVE blend lengths the
+            // animators authored (100/200/300/500/700/1000 ticks ->
+            // ~21/42/62/104/146/208 ms) instead of flattening them all to a
+            // fixed clamp.
+            // CAnimationController1::SetAnimation (sub_732DC0) fades over
+            // blendIn of the new SetAnim PLUS the blendOut the previous
+            // ApplyAnim stored (sub_4BF480 -> controller+40), and the fade
+            // clock (sub_731AC0) runs in ticks: elapsedMs * 4.8.
+            float fade = float(prevBlendOut_ + p->blendInMs) / (std::max)(clockScale, 1e-4f);
+            curBlendIn_ = p->blendInMs;
             clipA_ = clipB_; clockA_ = clockB_; rateA_ = rateB_; locoA_ = locoB_; loopA_ = loopB_;
             clipB_ = p->clip;
             clockB_ = p->reset ? 0.f : clockB_;
             rateB_ = (ctx.syncWindowMs > 1.f && p->startMs > 0) ? float(p->startMs) * p->rate / ctx.syncWindowMs : p->rate;
+            // ApplyAnim with a duration: speed = clipDurationMs * rate / fitMs.
+            // clockB_ advances in ticks (dtMs * rate * clockScale), and
+            // clipDurationMs = ticks / clockScale, so this lands the last
+            // tick exactly at fitMs.
+            if (fitMs > 0.f && ctx.durOf) {
+                // ApplyAnim (sub_8AEAE0): speed = ref * rate / duration, where
+                // ref is the SetAnim "startMs" value when set (this+84) and the
+                // clip's own length otherwise.
+                const float durMs = ctx.durOf(clipB_) / (std::max)(clockScale, 1e-4f);
+                const float refMs = p->startMs > 0 ? float(p->startMs) : durMs;
+                if (refMs > 0.f) rateB_ = refMs * p->rate / fitMs;
+            }
             locoB_ = IsLoco(clipB_);
             loopB_ = p->loop;
             blendDur_ = (std::min)((std::max)(fade, ctx.blendMin), ctx.blendMax);
             blendT_ = (blendDur_ > 1.f) ? 0.f : 1.f;
             prevBlendOut_ = p->blendOutMs;
             state_ = state; paramIdx_ = idx;
+            DbgLog("[clip] st=%d phase=%d slot=%d %s -> %s rate=%.2f loop=%d fade=%.0fms",
+                   (int)state, phaseIdx_, idx, clipA_.c_str(), clipB_.c_str(), rateB_, (int)loopB_, blendDur_);
         }
     } else if (!p && clipB_.empty()) {
         clipB_ = "00074"; clockB_ = 0.f; rateB_ = 1.f; locoB_ = false; blendT_ = 1.f;
@@ -245,12 +335,12 @@ scn::Pose AnimController::Update(ActorState state, const AnimCtx& rawCtx, float 
 
 void Crossfader::Set(const SAnimParam* param, const std::function<float(const std::string&)>& durOf) {
     if (!param || param->clip == clipB_) return;
-    float fade = float(prevBlendOut_);   // cross uses the OUTGOING clip's blendOut (1:1 C++)
+    float fade = float(prevBlendOut_ + param->blendInMs);   // outgoing blendOut + incoming blendIn (sub_732DC0)
     clipA_ = clipB_; clockA_ = clockB_; rateA_ = rateB_; loopA_ = loopB_; durA_ = durB_;
     clipB_ = param->clip; clockB_ = param->reset ? 0.f : clockB_;
     rateB_ = param->rate ? param->rate : 1.f; loopB_ = param->loop;
     durB_ = durOf ? durOf(param->clip) : 0.f;
-    blendDur_ = (std::max)(fade, float(param->blendInMs)); blendT_ = blendDur_ > 1.f ? 0.f : 1.f; prevBlendOut_ = param->blendOutMs;
+    blendDur_ = fade; blendT_ = blendDur_ > 1.f ? 0.f : 1.f; prevBlendOut_ = param->blendOutMs;
 }
 
 scn::Pose Crossfader::Update(float dtMs, float clockScale) {
