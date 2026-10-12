@@ -9,6 +9,8 @@ A prebuilt client is included in `build/Release/`. To play you only need to add 
 1. Copy the game resources into `build/Release/resources/` (layout below).
 2. Run `Run.bat` (or `build/Release/S4Client.exe`).
 
+The client starts offline (`"online": { "enabled": false }` in `config.json`).
+
 ## Required game resources
 
 Game resources are proprietary and are intentionally **not** included in this repository.
