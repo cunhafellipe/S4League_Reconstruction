@@ -49,6 +49,8 @@ The outer folder must be named exactly `resources`. Do not commit extracted asse
     "weapons": [ { "scn": "sword.scn", "states": "PlasmaSword" } ],
     "online": { "enabled": false, "server": "127.0.0.1", "port": 4100, "nickname": "player" },
     "resource_mode": "normal",
+    "music_enabled": false,
+    "music_track": "",
     "graphics_quality": "high",
     "resolution": "1600x900",
     "display": "windowed",
@@ -58,7 +60,17 @@ The outer folder must be named exactly `resources`. Do not commit extracted asse
 
 - `weapons`: up to 3 slots (keys `1`/`2`/`3`); `scn` is a file in `resources/resources/model/weapon/`, `states` the `NormalState_<X>` suffix of the actor-state Lua. The `F4` menu writes this list.
 - `online`: address of a multiplayer relay server (WebSocket on `port`, UDP on `port + 1`). The relay server is not part of this repository; with `enabled: false` the client plays offline.
-- `resource_mode`: `normal` uses `resources/resources/script`. `full` uses an extended script folder given by an optional `"script_dir"` key, falling back to `normal` when it is missing.
+- `resource_mode`: `normal` reads the vanilla tree (`resources/`). `full` reads an extended resource tree with the same layout (`xml/` + `resources/`), found automatically next to `resources/` (the folder with the richest script folder) or given by an optional `"full_dir"` key; it falls back to `normal` when none is found. The scripts of either set work whether they are plain text or compiled Lua.
+- `music_enabled` / `music_track`: the music is **off** by default. `ESC > Settings` (Music, Track), `F5` and `F6` change it and every change is saved here; `music_track` is a file of the `Bgm` folder (`"Bgm/x.ogg"`), empty = the map's own playlist.
+
+## Version 2.2
+
+- **Vanilla resources**: the data scripts are executed instead of text-scanned, so the compiled (`LuaQ`) scripts of an unmodified client work, and `resource_mode` switches the whole resource tree (models, xml, sounds, UI, scripts).
+- **Actor states run natively**: every `actorstates_*.lua` is executed with a recorder standing in for the client's bindings; animations, sounds, effects, weapon-change forms (shape change) and ghost trails come from the scripts.
+- **Combat from the attack scripts**: every `CreateCAttack` shape and fire time, critical / depends-on rules, stun, blow, uppercut (the attacker rises), push, knock-down / stand-up / death on the victim, camera shake.
+- **Maps**: animated map objects and effects, sky pass, GPU buffers for the static geometry (much higher FPS).
+- **Other players' weapons** are holstered like ours; holstered guns hang straight on the hip.
+- **Tools**: clones (`C` leaves a copy of you with its pose and effects, `V` releases them; they can be hit), `PrtScr` saves `screenshots/*.png`, `s4_crash.log` / `s4_crash.dmp` on a crash, `loaded resources.log` (every model / texture / effect / sound with its memory), unused textures and sounds are released, the client is large-address-aware (4 GB).
 
 ## What works
 
@@ -92,7 +104,7 @@ The outer folder must be named exactly `resources`. Do not commit extracted asse
 ## Known gaps
 
 - Default bullet tracer for guns without a beam sequence (`CGunTracerNode`) is approximated.
-- Not applied yet from the Lua: weapon swing ghost trails (`AddGhostTrail`), camera shake, hit flinch (`SetPartialAnim`), knock-down/stun on the victim (`AddBlowCondition`, `AddStunCondition`), guard/counter rules, real damage values (critical, distance drop-off), explosive projectiles (rockets, bombs, mines).
+- Not applied yet from the Lua: movement calls of some weapons (Iron Boots boost, `SetDelayDrop`, `SetTimeToStaySky`, `SetJUMP_POWER`), the SP system, guard rules, distance drop-off of damage, explosive projectiles (rockets, bombs, mines). Blow flight, down time and shake length are approximations.
 - Effect particle size uses half of the keyframe size (matches the original on screen; the exact scale in the effect node chain is still being located).
 - Other players' weapons: rigid pieces only (skinned pieces and some special weapons are not drawn on them yet).
 - Some weapon skins and effects still need accuracy work.
@@ -125,7 +137,10 @@ The output goes to `build/Release/S4Client.exe`. Run it with `Run.bat` from the 
 - `F1`: weapon-bone editing mode
 - `F2`: cycle FPS cap (60 / 144 / uncapped)
 - `F4`: inventory / weapon selector
-- `F5` / `F6`: pause music / next track
+- `F5` / `F6`: music on / off, next track (`Shift+F6` previous); saved in `config.json`
+- `C`: leave a clone where you stand (as many as you want); `V`: release them
+- `PrtScr`: screenshot to `screenshots/`
+- `[` / `]` (gun holstered): turn the holstered grip side
 
 ## Repository policy
 

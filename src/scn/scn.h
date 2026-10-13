@@ -2,6 +2,7 @@
 // Pure binary parsing only - bone/animation sampling and skinning live in
 // scn/skin.h (ported from scn_skin.js).
 #pragma once
+#include "app/reslog.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,6 +16,11 @@ struct Face { uint16_t a = 0, b = 0, c = 0; };
 struct VecKey  { uint32_t t; float v[3]; };
 struct QuatKey { uint32_t t; float q[4]; };
 struct VisKey  { uint32_t t; float v; };   // visibility (opacity) 0..1 at tick t
+// Vertex animation ("as morph vertexani" effect meshes): at tick t the listed
+// vertices take these positions / UVs; the others keep the previous key's.
+struct MorphVert { uint32_t idx; float p[3]; };
+struct MorphUv   { uint32_t idx; float u, v; };
+struct MorphKey  { uint32_t t; std::vector<MorphVert> verts; std::vector<MorphUv> uvs; };
 
 struct Anim {
     std::string name;
@@ -26,6 +32,7 @@ struct Anim {
     std::vector<VecKey>  trans, scale;
     std::vector<QuatKey> rot;
     std::vector<VisKey> vis;   // opacity track (effect meshes fade with it); empty = always 1
+    std::vector<MorphKey> morph;   // vertex animation keys (model anims only)
 };
 
 struct BoneWeight { uint32_t vertex; float weight; };
@@ -38,6 +45,10 @@ struct SkinBone {
 enum RenderFlag : uint32_t {
     RF_NO_LIGHT = 1, RF_TRANSPARENT = 2, RF_CUTOUT = 4, RF_NO_CULLING = 8,
     RF_NO_DEPTH_WRITE = 64,
+    RF_NO_FOG = 512,            // "NoFog" in the material name
+    RF_NO_MIPMAP = 2048,        // "nomipmap" (Object43_alphatest1_nomipmap = 4|2048; NOT a depth flag)
+    // Runtime only (not in files): draw without the depth test - the [SKY] pass.
+    RF_RT_NO_DEPTH_TEST = 0x20000000u,
 };
 
 struct TexItem {
@@ -89,12 +100,22 @@ struct Box {
     Vec3 halfExtents;
 };
 
+// A LINE chunk (CShapeNode): `pts` = segments as from.xyz,to.xyz pairs in the
+// node's space. Weapons carry "Line01" along the blade for the ghost trail.
+struct Line {
+    std::string name, parent;
+    float matrix[16];
+    std::vector<float> pts;
+};
+
 struct Scene {
+    reslog::Tag memTag;   // counts this scene's memory in "loaded resources.log"
     uint32_t version = 0;
     std::string dir;    // folder the .scn was loaded from (texture base) - set by Parse()
     std::vector<Model> models;
     std::vector<Bone> bones;
     std::vector<Box> boxes;
+    std::vector<Line> lines;
     std::vector<std::string> animNames;
     std::vector<const Model*> meshes;   // models with geometry (positions+indices non-empty)
     // Costume node parts only: skeleton bone the scene hangs from

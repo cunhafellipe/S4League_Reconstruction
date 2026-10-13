@@ -21,6 +21,8 @@ const std::unordered_map<std::string, int>& WeaponTypeIds(const std::string& res
 
 // Weapon type number from a Lua state suffix ('CounterSword', 'PlasmaSword', ...),
 // via typeBySuffix (anim::WeaponAttackMap::typeBySuffix).
+// WEAPONTYPE_* name of a numeric weapon type (the item's <ability type>), "" if unknown.
+std::string WeaponTypeName(const std::string& resourcesPath, int id);
 std::optional<int> TypeFromSuffix(const std::string& resourcesPath, const std::string& suffix,
                                    const std::unordered_map<std::string, std::string>& typeBySuffix);
 

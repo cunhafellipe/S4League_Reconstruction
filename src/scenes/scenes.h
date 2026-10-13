@@ -17,6 +17,9 @@
 #include <vector>
 #include <string>
 #include <array>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <optional>
 
 // One <intro> block from _eu_intro.x7 (a logo animation).
@@ -88,6 +91,9 @@ struct BgInfo {
     std::vector<std::string> statics;   // [STATIC] object_N, in order
     std::vector<std::string> dynamics;  // [DYNAMIC] object_N (68 de 100 mapas traen)
     std::vector<std::string> bgm;       // [BGM] bgm_N playlist
+    // [ADDON_SEQUENCE] object_N=x.seq / object_N_Dummy=node: map effects
+    // looping on a node of the map's scenes (135 maps).
+    std::map<int, std::pair<std::string, std::string>> addonSeqs;   // N -> (seq, dummy)
 };
 
 #include "net/mp_client.h"
@@ -155,6 +161,12 @@ struct WorldState : IScene {
     void  LoadCharacterBody(bool asFemale);   // <sex>_bip + 00_<sex>_* parts (F7 toggles)
     bool  female = false;
     std::vector<scn::Scene> map;        // static map meshes (visible geometry)
+    int mapSkyIdx = -1;                 // which of `map` is the [SKY] scene (drawn around the eye)
+    // Map meshes uploaded once to GPU buffers (rebuilt on the first frame after
+    // LoadMap): per model its static mesh and the texture / lightmap per material.
+    struct MapMeshCache { int mesh = -1; std::vector<int> tex, lm; std::vector<std::pair<uint32_t, uint32_t>> ranges; };
+    std::unordered_map<const scn::Model*, MapMeshCache> mapMeshCache;
+    bool mapCacheDirty = true;
     std::vector<CollTri> collTris;      // precomputed world-space collision triangles
     scn::Scene character;               // male_bip skeleton + anims
     std::vector<scn::Scene> bodyParts;  // default male body/leg/hand/foot/face/hair
@@ -166,6 +178,7 @@ struct WorldState : IScene {
     float camSideCur = 1.f;             // -1 left .. +1 right shoulder, eased toward camSideTarget
     float camSideTarget = 1.f;          // Z toggles the over-the-shoulder side
     float camDist = 500.f;              // third-person distance behind (client depthoffset=500)
+    float camDistEff = 0.f;             // actual eye distance this frame (pulled in by map collision)
     float camEye[3] = { 0, 0, 0 };      // smoothed camera position (spring-damper follow)
     float camVel[3] = { 0, 0, 0 };      // camera velocity (SmoothDamp state)
     float curFov = 60.f;                // current FOV (lerps 60 idle -> 72 running)
@@ -221,6 +234,46 @@ struct WorldState : IScene {
     anim::LuaStates luaStates;
     scn::Scene  weapon;                 // .scn del arma (vacio = desarmado)
     std::string weaponStates;           // sufijo de NormalState_/RunState_ ("PlasmaSword")
+    anim::ItemLuaRows weaponRows;       // the item's weapon_lua.x7 rows (state -> weapon= / ani=)
+    float weaponItemRange = 0.f, weaponItemPower = 0.f;   // _eu_weapon.x7 <ability range / power>
+    std::unordered_set<std::string> peerHolsterClips;   // clips of the states that holster the weapon
+    std::unordered_map<std::string, std::string> humanAlt;   // SetAniNameForHuman: clip -> female clip
+    // Sigma blade shape change: the right click toggles the form when it ends.
+    bool weaponChangePending = false;
+    std::string weaponNormalAs, weaponRunAs, weaponChangeOnSeq, weaponChangeOffSeq;
+    bool humanAltBuilt = false;
+    // Each swing's CreateCAttack list from its weapon_*.lua function: hit
+    // shape, time, conditions (stun / blow / critical / camera shake).
+    std::vector<luaw::WeaponAttack> atkLuaWeak, atkLuaStrong, atkLuaStrong1, weapon2Attacks, jumpAttacks;
+    std::vector<std::vector<luaw::WeaponAttack>> atkLuaCombo;   // combo hits 2..5 (left_attack2..5)
+    // The swing in progress: its attacks fire at their own fireTime and hit
+    // whoever their shape (ray / box / fan / ...) reaches, in actor space.
+    const std::vector<luaw::WeaponAttack>* swingAttacks = nullptr;
+    unsigned swingStart = 0;
+    std::vector<char> swingFired;
+    float swingBaseDmg = 0.f;
+    void StartSwingAttacks(const std::vector<luaw::WeaponAttack>* atks, unsigned tnow, float baseDmg);
+    void ProcessSwingAttacks(unsigned tnow);
+    bool AttackShapeHits(const luaw::AttackShape& sh, float px, float py, float pz) const;
+    // Reaction to a hit taken (actorstates_gameplay.lua ActorState_Stun /
+    // Blow / Down / Standup / Death, DamageState_<weapon>).
+    enum ReactKind { REACT_NONE = 0, REACT_FLINCH, REACT_STUN, REACT_BLOW, REACT_DOWN, REACT_STANDUP, REACT_DEATH, REACT_UPPERCUT };
+    int reactKind = REACT_NONE, reactPhase = 0;
+    unsigned reactStart = 0, reactEnd = 0, reactPhaseStart = 0;
+    float reactVX = 0.f, reactVZ = 0.f;
+    bool reactLeftGround = false;
+    std::string reactFlinchClip;
+    void StartReaction(int kind, unsigned tnow, unsigned durMs);
+    float pushVX = 0.f, pushVZ = 0.f; unsigned pushStart = 0, pushEnd = 0;   // a hit's AddPushCondition
+    void PlayStateFx(const anim::ActorFunc* fn, unsigned tnow);
+    // Camera shake (SetCameraShake*: on a landed hit, or the state's own timed one).
+    unsigned shakeStart = 0, shakeEnd = 0, shakePendingAt = 0;
+    float shakeAmp = 0.f, shakePendingAmp = 0.f;
+    void StartShake(const std::vector<float>& f1, unsigned tnow);
+    // Nodes of the drawn weapon, character space, this frame (item <sequence>
+    // effects hang from them: tag "weaponfx", attachNode = node).
+    std::unordered_map<std::string, std::array<float, 16>> weaponNodeChar;
+    std::string weaponAttackSeq, weaponAttackOgg;   // item <other_effects attack_seq/attack_ogg> (counter sword)
     std::string weaponBone = "R_Hand_Dummy";   // dummy del bip al que cuelga (ver IsAttachDummyName)
     float weaponInvMount[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};   // inverso del dummy raiz del arma
     std::optional<int> weaponTypeId;    // WEAPONTYPE_* real (weapon_attach.x7), para el bone por-pieza
@@ -238,6 +291,11 @@ struct WorldState : IScene {
         std::string idleBone;
         std::string idleBoneOverride;
         int sceneIndex = 0;
+        // Barrel-down alignment of a gun holstered on the thigh (HolsterBarrelDown):
+        // 0 = not computed, 1 = valid, 2 = this weapon has none.
+        mutable int holsterState = 0;
+        mutable unsigned holsterGen = 0;
+        mutable float holsterRot[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     };
     std::vector<WeaponRenderPart> weaponParts;
     // Other players' weapons (mp 'equip' / roster: weapon .scn + its states):
@@ -265,6 +323,41 @@ struct WorldState : IScene {
     float gunMuzzle[3] = { 0.f, 0.f, 0.f };   // world place of the weapon's fire node, last frame
     bool gunMuzzleValid = false;
     void FireGunShot(unsigned tnow);
+    // Ghost trail (state:AddGhostTrail): the weapon's Line01 sampled every
+    // frame while the attack is inside [startMs, endMs]; each sample lives
+    // the CGhostTrailData LifeTime and the strip is drawn through them.
+    struct GhostSample { unsigned t; float a[3], b[3]; };
+    std::vector<GhostSample> ghostSamples;
+    const anim::ActorGhostTrail* ghostTrail = nullptr;
+    unsigned ghostStart = 0;
+    // Render-side clock (GetTickCount, like DrawWeaponParts/DrawEffects): the
+    // update's tnow is a QPC clock with another origin.
+    void StartGhostTrail(const anim::ActorGhostTrail* g) { ghostTrail = g; ghostStart = GetTickCount(); ghostSamples.clear(); }
+    // Clones (C key, as many as wanted): copies of us left where we were, our
+    // look and weapon, frozen in the pose we had - with the effects that were
+    // playing (frozen at that instant) and the weapon trail; targets for our
+    // attacks (they react, no damage sent anywhere). V releases them all.
+    struct Clone {
+        float pos[3] = { 0, 0, 0 }, yaw = 0.f, lift = 0.f, vy = 0.f, vx = 0.f, vz = 0.f;
+        unsigned born = 0, reactStart = 0;
+        std::string reactClip;
+        scn::AnimPose pose, lowerPose; bool lowerActive = false;
+        int react = 0;   // 0 held pose, 1 flinch clip, 2 blown (in the air), 3 landing/standup
+        // The held pose as GPU meshes (built on the first draw): no skinning per frame.
+        struct Baked { int mesh = -1; int tris = 0; int tex = -1; float world[16]; uint32_t flags = 0; };
+        std::vector<Baked> baked; bool bakedDone = false;
+        // The weapon trail as it was.
+        std::vector<GhostSample> ghostSamples; const anim::ActorGhostTrail* ghostTrail = nullptr;
+        unsigned ghostStart = 0, ghostAt = 0;
+    };
+    std::vector<Clone> clones;
+    void ReleaseClones(IRenderer* r = nullptr);
+    void CloneHit(Clone& c, float dmg, float stunMs, float blowDist, float blowPower, unsigned tnow);
+    void UpdateClones(unsigned tnow, float dt);
+    void DrawClones(IRenderer* r);
+    void DrawClone(IRenderer* r, Clone& c);
+    std::vector<int> cloneMeshesToFree;   // GPU meshes of released clones, freed on the next draw
+    void DrawGhostTrail(IRenderer* r, unsigned tnow);
     // Online combat: HP (starts at 100), hits sent through the relay server
     // (mpserver 'hit' -> target gets 'hurt'). The server only relays.
     float myHp = 100.f, myHpMax = 100.f;
@@ -278,7 +371,12 @@ struct WorldState : IScene {
     // direction (revolver: 4 rays per shot), plus its AddProjectileOffset
     // pattern (smash rifle: one offset per shot, cycling). Local x/y per unit
     // forward, x < 0 = right (script comments: -0.015 "right right").
-    struct GunRay { float x = 0.f, y = 0.f; std::vector<float> off; float pushMs = 0.f, pushSpeed = 0.f, pushAccel = 0.f; };
+    struct GunRay { float x = 0.f, y = 0.f; std::vector<float> off; float pushMs = 0.f, pushSpeed = 0.f, pushAccel = 0.f; float fireTime = 0.f; int group = 0; };
+    int gunRayGroups = 1;   // distinct fireTimes: 1 = all rays together, N = a burst of N rounds
+    std::vector<float> gunRoundOffsets;                       // each round's fireTime, ms from the first
+    struct PendingRound { unsigned at; int group; };
+    std::vector<PendingRound> gunPendingRounds;               // rounds of the burst still to fire
+    int gunForceGroup = -1;                                   // the round FireGunShot is firing now
     // A shot that hits a wall point-blank pushes the shooter back with that
     // attack's AddPushCondition (shotgun 3000 + 7x750, revolver 4x1125), moved
     // like the client's AttackEffect::CPush (beta sub_88BCD0): speed += accel*dt
@@ -290,7 +388,7 @@ struct WorldState : IScene {
     struct GunTracer { float a[3], b[3]; unsigned born; };   // bullet streak, muzzle -> impact (no beam .seq)
     // The weapon's tracer .seq (SetGunTracerAttachNode arg 2) CActLightning
     // nodes: a beam from the gun's fire node to where the shot landed.
-    struct BeamNode { seq::Node::Beam beam; uint32_t begin = 0, end = 0; };
+    struct BeamNode { seq::Node::Beam beam; uint32_t begin = 0, end = 0; uint32_t rgb = 0xFFFFFF; };   // rgb: tint (white for .seq beams)
     std::vector<BeamNode> gunBeamNodes;
     uint32_t gunBeamDuration = 0;
     struct GunBeam { float b[3]; unsigned born; };
@@ -318,6 +416,7 @@ struct WorldState : IScene {
     int   weaponSlot = 0;               // 1/2/3 cambian de slot
     int      weakCombo = 0;             // current row in the weak-attack combo chain
     unsigned lastWeakAt = 0;            // last weak click (600ms combo window)
+    bool weakQueued = false;            // a click during a combo hit: the next hit follows it
     // One weapon swing at a time: a single clip held for its wind-up + authored
     // duration + recovery delay, all read straight from the weapon's Lua data.
     anim::WeaponAnim weaponAnim;        // resolved in EquipWeaponFile for the current weapon
@@ -417,7 +516,7 @@ struct WorldState : IScene {
     // ones scheduled for the swing in progress (effect + its sound, fired
     // startTime ms after the swing starts; dropped if the swing is cut).
     std::vector<luaw::WeaponFireState::Sequence> atkSeqWeak, atkSeqStrong, atkSeqStrong1;
-    struct PendingSeq { unsigned atMs; std::string file, sound; };
+    struct PendingSeq { unsigned atMs; std::string file, sound; int index = 0; std::string node; };   // index: AddSequence's first arg; node: AddInstantEffect
     std::vector<PendingSeq> pendingSeqs;
     luaw::WeaponFireState jumpAttackLua;
 
@@ -438,6 +537,7 @@ struct WorldState : IScene {
         // Hung off the actor's scene node (sub_7C50D0(seq, "", actorScene)):
         // follows the actor's position and facing every frame.
         bool followActor = true;
+        float offX = 0.f, offZ = 0.f;   // effect-local shift (centres an AddSequence index-2 effect on the actor)
         // Effect owned by a state (fastrun trail): restarted while the state
         // lasts and removed when it ends. Empty = one-shot.
         std::string tag;
@@ -447,6 +547,10 @@ struct WorldState : IScene {
         // Recent placements (tick, effect matrix) - an AttachTarget particle
         // is drawn from where the emitter was when it was born.
         std::vector<std::pair<unsigned, std::array<float, 16>>> history;
+        // A clone's copy: stays at fixedWorld at frozenAge (never expires).
+        bool frozen = false;
+        unsigned frozenAge = 0, lastAge = 0;
+        std::array<float, 16> fixedWorld = {};
     };
     std::vector<ActiveEffect> activeEffects;
     bool seqEffectsEnabled = true;    // .seq particle/model effects (all 616 S10 .seq files parse)
@@ -501,6 +605,7 @@ struct WorldState : IScene {
     void ScanMaps();                    // fill `maps` from Resources/MapInfo/bginfo-*.ini
     void LoadMap(int index);            // (re)load map `index`: meshes, collision, spawn
     void PlayMapMusic(int index);
+    void ChangeMusic(int dir);
     void OnEnter()  override;
     void OnUpdate() override;
     void OnRender(IRenderer*) override;

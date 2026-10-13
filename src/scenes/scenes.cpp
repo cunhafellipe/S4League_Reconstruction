@@ -9,6 +9,10 @@
 #include "data/weapon_attach.h"
 #include "lua/lua_weapon_fire.h"
 #include "app/dbg.h"
+#include "app/respath.h"
+#include "app/crash.h"
+#include "lua/lua_script_scan.h"
+#include "app/reslog.h"
 #include "audio/audio.h"
 #include <fstream>
 #include <sstream>
@@ -82,6 +86,7 @@ static scn::Pose MakeWeaponPose(const scn::Scene& scene, const anim::WeaponAnim&
         for (char& c : first) c = (char)std::tolower((unsigned char)c);
         if (first == "base") fallback = scene.animNames[1];
     }
+    const std::string assembledClip = fallback;   // before the family filter below
     // Only a clip of the same family as the one the body plays (letters before
     // the digits: R0003 for a Counter Sword's R* clips). arcane_counter_galaxy
     // ships sword clips only (00068...): its first frame stood the blade up
@@ -101,8 +106,12 @@ static scn::Pose MakeWeaponPose(const scn::Scene& scene, const anim::WeaponAnim&
     // has it, else its bind pose.
     if (holstered) {
         if (use(characterPose.clipA)) return out;
+        // BASE of a gun is its exploded layout (skull_handgun: the slide, hammer
+        // and trigger pieces fanned out - "bent"). Its own first clip, first
+        // frame, is the assembled gun.
         scn::Pose bind;
         bind.fallbackClip = fallback;
+        if (!assembledClip.empty()) { bind.clipA = assembledClip; bind.tickA = 0; bind.loopA = false; }
         return bind;
     }
     if ((attack || weapon2Active) && use(characterPose.clipA)) return out;
@@ -155,7 +164,7 @@ static std::vector<IntroBlock> LoadIntro(const char* path) {
 }
 
 void IntroState::OnEnter() {
-    blocks = LoadIntro("resources/resources/intro/_eu_intro.x7");
+    blocks = LoadIntro(RESC("resources/resources/intro/_eu_intro.x7"));
     start = GetTickCount(); blockIdx = 0;
     DbgLog("[intro] blocks=%zu", blocks.size());
 }
@@ -181,7 +190,7 @@ void IntroState::OnRender(IRenderer* r) {
 void IntroState::OnLeave()  {}
 
 void TitleState::OnEnter() {
-    character = scn::Parse("resources/resources/model/interface/title_cha00.scn");
+    character = scn::Parse(RESC("resources/resources/model/interface/title_cha00.scn"));
     animStart = GetTickCount();
     DbgLog("[scn] title_cha00 ok=%d models=%zu", (int)character.ok, character.models.size());
     for (size_t i = 0; i < character.models.size() && i < 3; ++i) {
@@ -507,6 +516,122 @@ static void BuildCollTris(const std::vector<scn::Scene>& map, std::vector<CollTr
 // One drawable piece of the assembled character (already skinned/attached).
 struct CharPiece { const scn::Model* m; const std::string* dir; std::vector<scn::Vec3> verts; std::array<float,16> world; };
 
+// A gun holstered on the hip (Gun_Dummy, hung on the left thigh) hangs STRAIGHT:
+// barrel down, grip straight back at the player - a "|" seen from behind - and
+// stays like that whatever the leg does. The position comes from the dummy, the
+// orientation is fixed in the character's space: the weapon's barrel axis (its
+// fire dummy seen from the mount) goes to "down", and the side the body hangs
+// on (the body piece against the barrel pieces, perpendicular to the barrel)
+// goes to "backward" (+Z, the model faces -Z). gHolsterRoll45 turns that side
+// about the vertical in 45 degree steps (4 = straight back). R is the rotation
+// applied in the mount frame, row-vector form, no translation.
+static int gHolsterRoll45 = 4;
+static unsigned gHolsterGen = 1;
+static bool HolsterBarrelDown(const scn::Scene& weapon, const float* invMount, const scn::Scene& /*skel*/,
+                              const std::string& /*bone*/, const std::string& mountName, float R[16]) {
+    std::string fire;
+    auto low = [](std::string n) { for (char& c : n) c = (char)std::tolower((unsigned char)c); return n; };
+    for (const scn::Bone& b : weapon.bones)
+        if (low(b.name).find("fire") != std::string::npos && low(b.name).find("dummy") != std::string::npos) { fire = b.name; break; }
+    if (fire.empty())
+        for (const scn::Model& m : weapon.models)
+            if (low(m.name).find("fire") != std::string::npos && low(m.name).find("dummy") != std::string::npos) { fire = m.name; break; }
+    if (fire.empty()) return false;
+    // The assembled gun: its first clip after BASE, first frame (BASE is the exploded layout).
+    scn::Pose bp; bp.clipA = "BASE";
+    if (weapon.animNames.size() > 1) {
+        std::string first = weapon.animNames[0];
+        for (char& c : first) c = (char)std::tolower((unsigned char)c);
+        if (first == "base") bp.clipA = weapon.animNames[1];
+    }
+    const scn::NodeResolver nodes = scn::MakeNodeResolver(weapon, bp, true);
+    const scn::Mat4* fwp = nodes(fire);
+    if (!fwp) return false;
+    const scn::Mat4 fw = *fwp;   // the resolver hands out one shared slot
+    float invM[16];
+    std::memcpy(invM, invMount, sizeof(invM));
+    if (!mountName.empty())
+        if (const scn::Mat4* mw = nodes(mountName)) { const scn::Mat4 inv = scn::Mat4InvAffine(*mw); std::memcpy(invM, inv.data(), sizeof(invM)); }
+    float fm[16]; Mat4MulS(fw.data(), invM, fm);
+    float e1[3] = { fm[12], fm[13], fm[14] };   // barrel axis in the mount frame
+    const float al = std::sqrt(e1[0]*e1[0] + e1[1]*e1[1] + e1[2]*e1[2]);
+    if (al < 1e-3f) return false;
+    for (float& v : e1) v /= al;
+
+    // The body piece (most vertices) against the others (the barrel pieces):
+    // which way the body hangs from the barrel line, in the mount frame.
+    size_t bodyIdx = weapon.models.size(), bodyN = 0;
+    for (size_t i = 0; i < weapon.models.size(); ++i)
+        if (weapon.models[i].vertices.size() > bodyN && !weapon.models[i].faces.empty()) { bodyN = weapon.models[i].vertices.size(); bodyIdx = i; }
+    if (bodyIdx == weapon.models.size()) return false;
+    double sb[3] = { 0, 0, 0 }, so[3] = { 0, 0, 0 }; size_t nb = 0, no = 0;
+    for (size_t mi = 0; mi < weapon.models.size(); ++mi) {
+        const scn::Model& m = weapon.models[mi];
+        if (m.vertices.empty() || m.faces.empty()) continue;
+        const scn::Mat4* mwp = nodes(m.name);
+        if (!mwp) continue;
+        const scn::Mat4 mwm = *mwp;
+        float toMount[16]; Mat4MulS(mwm.data(), invM, toMount);
+        for (size_t vi = 0; vi < m.vertices.size(); vi += 2) {
+            float w[3]; XformPt(toMount, m.vertices[vi], w);
+            if (mi == bodyIdx) { sb[0] += w[0]; sb[1] += w[1]; sb[2] += w[2]; ++nb; }
+            else               { so[0] += w[0]; so[1] += w[1]; so[2] += w[2]; ++no; }
+        }
+    }
+    if (nb == 0) return false;
+    float g[3];
+    for (int i = 0; i < 3; ++i) g[i] = (float)(sb[i] / nb) - (no ? (float)(so[i] / no) : 0.f);
+    if (!no) {}   // single piece: the body's own centroid, seen from the mount origin
+    const float along = g[0]*e1[0] + g[1]*e1[1] + g[2]*e1[2];
+    for (int i = 0; i < 3; ++i) g[i] -= along * e1[i];
+    const float gl = std::sqrt(g[0]*g[0] + g[1]*g[1] + g[2]*g[2]);
+    if (gl < 1.f) return false;   // no side to hang on (symmetric): leave it to the bone
+    for (float& v : g) v /= gl;
+    const float e2[3] = { g[0], g[1], g[2] };
+    const float e3[3] = { e1[1]*e2[2] - e1[2]*e2[1], e1[2]*e2[0] - e1[0]*e2[2], e1[0]*e2[1] - e1[1]*e2[0] };
+    // Targets in the character's space: barrel down, body backward (+Z) turned by the roll step.
+    const float ang = (gHolsterRoll45 - 4) * 0.78539816f;
+    const float f1[3] = { 0.f, -1.f, 0.f };
+    const float f2[3] = { std::sin(ang), 0.f, std::cos(ang) };
+    const float f3[3] = { f1[1]*f2[2] - f1[2]*f2[1], f1[2]*f2[0] - f1[0]*f2[2], f1[0]*f2[1] - f1[1]*f2[0] };
+    // Row-vector form: p_char = p_mount * R, R = sum over i of e_i^T f_i.
+    std::memset(R, 0, sizeof(float) * 16);
+    const float* E[3] = { e1, e2, e3 };
+    const float* F[3] = { f1, f2, f3 };
+    for (int k = 0; k < 3; ++k)
+        for (int r = 0; r < 3; ++r)
+            for (int q = 0; q < 3; ++q) R[r*4+q] += E[k][r] * F[k][q];
+    R[15] = 1.f;
+    DbgLog("[weapon] holster fixed: barrel down, body side rolled %d deg (body offset %.0f)", (gHolsterRoll45 - 4) * 45, gl);
+    return true;
+}
+
+// The holstered gun is bolted to the dummy's bone: the animation moves the bone
+// (thigh -> Gun_Dummy) and the weapon goes with it, whatever it does. The only
+// correction is the weapon's offset FROM the bone: the fixed rotation that makes
+// it straight at the bone's bind pose (HolsterBarrelDown: barrel down, grip
+// straight back) is expressed in the bone's own frame, so with the bone at bind
+// it is that exact pose and as the bone moves it moves rigidly with it.
+// out = fixedRot * inverse(bind rotation) * current rotation, at the bone's position.
+static void HolsterWithSwing(const scn::Scene& skel, const float* hand, const float* fixedRot, float out[16]) {
+    for (const scn::Bone& b : skel.bones)
+        if (b.name == "Gun_Dummy") {
+            scn::Mat4 bind;
+            std::memcpy(bind.data(), b.matrix, sizeof(float) * 16);
+            bind[12] = bind[13] = bind[14] = 0.f;
+            const scn::Mat4 invBind = scn::Mat4InvAffine(bind);
+            float now[16];
+            std::memcpy(now, hand, sizeof(now));
+            now[12] = now[13] = now[14] = 0.f;
+            float tmp[16];
+            Mat4MulS(fixedRot, invBind.data(), tmp);
+            Mat4MulS(tmp, now, out);
+            out[12] = hand[12]; out[13] = hand[13]; out[14] = hand[14];
+            return;
+        }
+    std::memcpy(out, hand, sizeof(float) * 16);
+}
+
 // Skin/attach every mesh of every body part against the shared skeleton at
 // `tick`, producing world-space pieces (model space, before camera).
 // A skeleton bone's world with the upper/lower split the body is skinned with
@@ -688,14 +813,100 @@ static void RenderScnCharacter(IRenderer* r, const scn::Scene& skel,
     DrawCharPieces(r, pieces, nullptr);
 }
 
-// Draw a static map scene (no skinning): each model by its own node matrix.
-static void DrawMapScene(IRenderer* r, const scn::Scene& sc) {
+// Draw a map scene (no skinning): each model by its own node matrix. Animated
+// scenes (210 of 612 background .scn: [DYNAMIC] objects, skies, screens,
+// gears, blinking lights) loop their clip: moving nodes, visibility tracks,
+// vertex and UV ("uvani") keys, at the clip's 4.8 ticks per ms.
+static void DrawMapScene(IRenderer* r, const scn::Scene& sc, unsigned nowMs, const float* skyEye = nullptr,
+                         std::unordered_map<const scn::Model*, WorldState::MapMeshCache>* cache = nullptr) {
+    scn::Pose pose;
+    const bool animated = !sc.animNames.empty();
+    if (animated) { pose.clipA = sc.animNames[0]; pose.tickA = (uint32_t)((double)nowMs * 4.8); pose.loopA = true; }
+    bool anyMoving = false;
+    if (animated)
+        for (const scn::Model& m : sc.models)
+            for (const scn::Anim& a : m.anims)
+                if (!a.trans.empty() || !a.rot.empty() || !a.scale.empty()) { anyMoving = true; break; }
+    const scn::NodeResolver nodes = anyMoving ? scn::MakeNodeResolver(sc, pose, true) : scn::NodeResolver{};
+    std::vector<scn::Vec3> morphPos;
+    std::vector<scn::Vec2> morphUv;
     for (const scn::Model& m : sc.models) {
         if (m.vertices.empty() || m.faces.empty()) continue;
         if (m.name.rfind("oct_", 0) == 0) continue;   // collision octree meshes are invisible
+        // Game-rule team areas (station2_sector.scn: sector01_ally/_enemy,
+        // map-sized additive volumes): not scenery.
+        if (m.name.rfind("sector", 0) == 0) continue;
         const size_t nv = m.vertices.size();
-        const bool hasUv = nv == m.uv1.size();
+        bool hasUv = nv == m.uv1.size();
         const bool hasUv2 = nv == m.uv2.size();
+        // Animation of this mesh, if any.
+        const float* world = m.matrix;
+        float vis = 1.f;
+        const std::vector<scn::Vec3>* verts = &m.vertices;
+        const std::vector<scn::Vec2>* uvs = &m.uv1;
+        if (animated && !m.anims.empty()) {
+            bool moves = false;
+            for (const scn::Anim& a : m.anims) if (!a.trans.empty() || !a.rot.empty() || !a.scale.empty()) { moves = true; break; }
+            if (moves && nodes) if (const scn::Mat4* nw = nodes(m.name)) world = nw->data();
+            vis = (std::max)(0.f, (std::min)(1.f, scn::ModelVisibility(m, pose.clipA, pose.tickA, true)));
+            if (vis <= 0.004f) continue;
+            if (scn::SampleMorphPositions(m, pose.clipA, pose.tickA, true, morphPos)) verts = &morphPos;
+            if (hasUv && scn::SampleMorphUvs(m, pose.clipA, pose.tickA, true, morphUv)) uvs = &morphUv;
+        }
+        float worldCopy[16]; std::memcpy(worldCopy, world, sizeof(worldCopy));   // the resolver reuses its slot
+        if (skyEye) {
+            // The sky (sky_bluesky: +-862700, "NoDepthTest NoDepthWrite") is
+            // drawn around the eye, behind everything. A dome centred on the
+            // eye looks the same at any size, so it is scaled inside the far
+            // plane (300000); at its own size the far plane cut it to black.
+            const float k = 0.1f;
+            for (int i = 0; i < 12; ++i) if ((i & 3) != 3) worldCopy[i] *= k;
+            for (int i = 0; i < 3; ++i) worldCopy[12 + i] = worldCopy[12 + i] * k + skyEye[i];
+        }
+        world = worldCopy;
+        r->meshFade = vis;
+        const uint32_t drawFlags = m.renderFlag | (skyEye ? (uint32_t)scn::RF_RT_NO_DEPTH_TEST : 0u);
+        // Vertices and UVs as in the file (no vertex/UV animation this mesh):
+        // its GPU buffers are built once and every material is one draw from
+        // them - no per-frame vertex rebuild, copy or texture-path lookup.
+        if (cache && verts == &m.vertices && uvs == &m.uv1) {
+            WorldState::MapMeshCache& c = (*cache)[&m];
+            if (c.mesh == -1) {
+                std::vector<scn::TexItem> its = m.texItems;
+                if (its.empty()) {
+                    scn::TexItem one; one.main = m.texture; one.side = m.sideTexture;
+                    one.faceStart = 0; one.faceCount = (uint32_t)m.faces.size();
+                    its.push_back(one);
+                }
+                bool anyLm = false;
+                for (const scn::TexItem& it : its) if (!it.side.empty()) anyLm = true;
+                const int fpv = (anyLm && hasUv2) ? 7 : 5;
+                std::vector<float> vb(nv * fpv, 0.f);
+                for (size_t i = 0; i < nv; ++i) {
+                    float* o = &vb[i * fpv];
+                    o[0] = m.vertices[i].x; o[1] = m.vertices[i].y; o[2] = m.vertices[i].z;
+                    if (hasUv) { o[3] = m.uv1[i].u; o[4] = m.uv1[i].v; }
+                    if (fpv == 7) { o[5] = m.uv2[i].u; o[6] = m.uv2[i].v; }
+                }
+                std::vector<unsigned short> ib; ib.reserve(m.faces.size() * 3);
+                for (const scn::Face& f : m.faces) { ib.push_back(f.a); ib.push_back(f.b); ib.push_back(f.c); }
+                c.mesh = r->CreateStaticMesh(vb.data(), fpv, (int)nv, ib.data(), (int)ib.size());
+                if (c.mesh < 0) c.mesh = -2;   // could not be made: keep the per-frame path
+                for (const scn::TexItem& it : its) {
+                    if (it.faceCount == 0 || it.faceStart >= m.faces.size()) continue;
+                    const uint32_t cnt = (uint32_t)((std::min)((size_t)it.faceStart + it.faceCount, m.faces.size()) - it.faceStart);
+                    c.ranges.push_back({ it.faceStart, cnt });
+                    c.tex.push_back(r->LoadTexture((sc.dir.empty() ? it.main : sc.dir + "/" + it.main).c_str()));
+                    c.lm.push_back(fpv == 7 && !it.side.empty() ? r->LoadTexture((sc.dir.empty() ? it.side : sc.dir + "/" + it.side).c_str()) : -1);
+                }
+            }
+            if (c.mesh >= 0) {
+                for (size_t k = 0; k < c.ranges.size(); ++k)
+                    r->DrawStaticMesh(c.mesh, (int)c.ranges[k].first * 3, (int)c.ranges[k].second, c.tex[k],
+                                      vis >= 0.999f ? c.lm[k] : -1, world, drawFlags);   // a fading mesh: no lightmap pass (meshFade)
+                continue;
+            }
+        }
         // MULTI-TEXTURA: cada texture_item cubre [faceStart, faceStart+faceCount).
         // Se dibuja un lote por item; dibujar todo con la primera textura pintaba
         // mal el 59% de las caras del mapa (y el skybox entero con una sola cara).
@@ -718,27 +929,31 @@ static void DrawMapScene(IRenderer* r, const scn::Scene& sc) {
             if (idx.empty()) continue;
             std::string texPath = sc.dir.empty() ? it.main : (sc.dir + "/" + it.main);
             int tex = r->LoadTexture(texPath.c_str());
-            const bool hasLM = !it.side.empty() && hasUv2;
+            // A fading mesh (visibility < 1) goes through DrawMesh, which applies meshFade.
+            const bool hasLM = !it.side.empty() && hasUv2 && vis >= 0.999f;
+            const std::vector<scn::Vec3>& vv = *verts;
+            const std::vector<scn::Vec2>& uu = *uvs;
             if (hasLM) {   // main texture x baked lightmap (uv2) -> warm lit map
                 std::string lmPath = sc.dir.empty() ? it.side : (sc.dir + "/" + it.side);
                 int lm = r->LoadTexture(lmPath.c_str());
                 pu.assign(nv * 7, 0.f);
                 for (size_t i = 0; i < nv; ++i) {
-                    pu[i*7+0]=m.vertices[i].x; pu[i*7+1]=m.vertices[i].y; pu[i*7+2]=m.vertices[i].z;
-                    pu[i*7+3]= hasUv ? m.uv1[i].u : 0.f; pu[i*7+4]= hasUv ? m.uv1[i].v : 0.f;
+                    pu[i*7+0]=vv[i].x; pu[i*7+1]=vv[i].y; pu[i*7+2]=vv[i].z;
+                    pu[i*7+3]= hasUv ? uu[i].u : 0.f; pu[i*7+4]= hasUv ? uu[i].v : 0.f;
                     pu[i*7+5]= m.uv2[i].u; pu[i*7+6]= m.uv2[i].v;
                 }
-                r->DrawMeshLightmap(pu.data(), (int)nv, idx.data(), (int)idx.size(), tex, lm, m.matrix, m.renderFlag);
+                r->DrawMeshLightmap(pu.data(), (int)nv, idx.data(), (int)idx.size(), tex, lm, world, m.renderFlag | (skyEye ? (uint32_t)scn::RF_RT_NO_DEPTH_TEST : 0u));
             } else {
                 pu.assign(nv * 5, 0.f);
                 for (size_t i = 0; i < nv; ++i) {
-                    pu[i*5+0]=m.vertices[i].x; pu[i*5+1]=m.vertices[i].y; pu[i*5+2]=m.vertices[i].z;
-                    pu[i*5+3]= hasUv ? m.uv1[i].u : 0.f;  pu[i*5+4]= hasUv ? m.uv1[i].v : 0.f;
+                    pu[i*5+0]=vv[i].x; pu[i*5+1]=vv[i].y; pu[i*5+2]=vv[i].z;
+                    pu[i*5+3]= hasUv ? uu[i].u : 0.f;  pu[i*5+4]= hasUv ? uu[i].v : 0.f;
                 }
-                r->DrawMesh(pu.data(), (int)nv, idx.data(), (int)idx.size(), tex, m.matrix, m.renderFlag);
+                r->DrawMesh(pu.data(), (int)nv, idx.data(), (int)idx.size(), tex, world, m.renderFlag | (skyEye ? (uint32_t)scn::RF_RT_NO_DEPTH_TEST : 0u));
             }
         }
     }
+    r->meshFade = 1.f;
 }
 
 void TitleState::OnRender(IRenderer* r) {
@@ -784,7 +999,7 @@ static void DumpTree(const gui::Widget& w, int depth, int& total, int& texts) {
     for (auto& c : w.children) DumpTree(c, depth + 1, total, texts);
 }
 void LoginState::OnEnter() {
-    ui = gui::LoadXui("resources/resources/xui/ui/1login.xui");
+    ui = gui::LoadXui(RESC("resources/resources/xui/ui/1login.xui"));
     int total = 0, texts = 0; DumpTree(ui, 0, total, texts);
     DbgLog("[login] xui='%s' kids=%zu totalWidgets=%d textWidgets=%d",
            ui.type.c_str(), ui.children.size(), total, texts);
@@ -813,7 +1028,7 @@ static bool Inside(const gui::Widget* w, int x, int y) {
 static const int kRowTop = 208, kRowH = 32;   // server_list_ListBox grid (4server.xui)
 
 void ServerSelectState::OnEnter() {
-    ui = gui::LoadXui("resources/resources/xui/ui/4server.xui");
+    ui = gui::LoadXui(RESC("resources/resources/xui/ui/4server.xui"));
     // The off-screen row template (server_list_item_GroupBox @ top=612) is a
     // clone source, not a real widget - hide it so it stops rendering as a
     // stray bar at the bottom. Flatten() skips a subtree when its show=false.
@@ -823,7 +1038,7 @@ void ServerSelectState::OnEnter() {
     // The male character = male_bip.scn skeleton (81 bones + anims) with the
     // default "00_male_*" body meshes skinned to it. male_bip.scn itself holds
     // only the rig + a default weapon; the body comes from these part files.
-    const char* base = "resources/resources/model/character/";
+    const char* base = RESC("resources/resources/model/character/");
     character3d = scn::Parse((std::string(base) + "male_bip.scn").c_str());
     DbgLog("[char] male_bip ok=%d models=%zu bones=%zu clips=%zu", (int)character3d.ok,
            character3d.models.size(), character3d.bones.size(), character3d.animNames.size());
@@ -1094,12 +1309,15 @@ static std::string ReadTextFile(const char* path) {
 // A missing section is created with a random id and the Windows user name.
 struct OnlineConfig { bool enabled = true; std::string server = "127.0.0.1"; int port = 4100; int id = 0; std::string nickname; };
 static OnlineConfig gOnline;
-// config.json "resource_mode": "normal" = the client scripts in
-// resources/resources/script; "full" = an extended script folder given by
-// config.json "script_dir" (newer skins, split attack files). Falls back to
-// the normal folder when that one is missing.
+// config.json "resource_mode": "normal" = the vanilla tree (resources/);
+// "full" = the extended tree given by "full_dir" (see respath.h), whose
+// richest script folder is used. Falls back to normal when it is missing.
 static std::string gResourceMode = "normal";
-static std::string gScriptDirFull;
+static std::string gFullDir;   // config "full_dir" (optional; found automatically otherwise)
+// config.json "music_enabled" (default false: silent) and "music_track"
+// ("Bgm/x.ogg", empty = the map's own playlist): ESC > Settings, F5, F6.
+static bool gMusicOn = false;
+static std::string gMusicTrack;
 // config.json "graphics_quality": "low" | "medium" | "high" (ESC menu cycles it).
 static int gGraphicsQuality = 2;
 static const char* const kQualityNames[3] = { "low", "medium", "high" };
@@ -1165,9 +1383,31 @@ static void ApplyDisplayMode() {
     }
 }
 static std::string ScriptDir() {
-    if (gResourceMode == "full" && !gScriptDirFull.empty() && GetFileAttributesA(gScriptDirFull.c_str()) != INVALID_FILE_ATTRIBUTES)
-        return gScriptDirFull;
-    return "resources/resources/script";
+    static std::string chosen;   // the root is fixed for the whole run
+    if (!chosen.empty()) return chosen;
+    chosen = RES("resources/resources/script");
+    if (gResourceMode == "full" && respath::Root() != "resources") {
+        // The extended tree may carry several script folders (script, and
+        // extended ones next to it): take the one with the most .lua files.
+        const std::string base = respath::Root() + "/resources/";
+        size_t best = 0;
+        WIN32_FIND_DATAA dd;
+        HANDLE h = FindFirstFileExA((base + "script*").c_str(), FindExInfoBasic, &dd, FindExSearchLimitToDirectories, nullptr, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(dd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                const std::string dir = base + dd.cFileName;
+                if (GetFileAttributesA((dir + "/actorstates_gameplay.lua").c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+                size_t n = 0;
+                WIN32_FIND_DATAA fd;
+                HANDLE f = FindFirstFileA((dir + "/*.lua").c_str(), &fd);
+                if (f != INVALID_HANDLE_VALUE) { do ++n; while (FindNextFileA(f, &fd)); FindClose(f); }
+                if (n > best) { best = n; chosen = dir; }
+            } while (FindNextFileA(h, &dd));
+            FindClose(h);
+        }
+    }
+    return chosen;
 }
 static bool gOnlineLoaded = false;
 
@@ -1200,8 +1440,10 @@ static void WriteWeaponSlots(const std::vector<SWeaponSlot>& slots) {
       << ", \"server\": \"" << gOnline.server << "\", \"port\": " << gOnline.port
       << ", \"nickname\": \"" << gOnline.nickname << "\" },\n";
     f << "    \"resource_mode\": \"" << gResourceMode << "\",\n";
-    if (!gScriptDirFull.empty()) f << "    \"script_dir\": \"" << gScriptDirFull << "\",\n";
+    if (!gFullDir.empty()) f << "    \"full_dir\": \"" << gFullDir << "\",\n";
     f << "    \"graphics_quality\": \"" << kQualityNames[gGraphicsQuality] << "\",\n";
+    f << "    \"music_enabled\": " << (gMusicOn ? "true" : "false") << ",\n";
+    f << "    \"music_track\": \"" << gMusicTrack << "\",\n";
     f << "    \"resolution\": \"" << (gResW > 0 ? std::to_string(gResW) + "x" + std::to_string(gResH) : std::string("window")) << "\",\n";
     f << "    \"display\": \"" << (gBorderless ? "borderless" : "windowed") << "\",\n";
     f << "    \"aspect\": \"" << kAspects[gAspect] << "\",\n";
@@ -1226,7 +1468,16 @@ static void LoadOnlineConfig() {
         gOnline.nickname = JsonStringField(obj, "nickname");
     }
     { const std::string rm = JsonStringOrNull(text, "resource_mode"); if (rm == "full" || rm == "normal") gResourceMode = rm; }
-    { const std::string sd = JsonStringOrNull(text, "script_dir"); if (!sd.empty()) gScriptDirFull = sd; }
+    { const std::string fd = JsonStringOrNull(text, "full_dir"); if (!fd.empty()) gFullDir = fd; }
+    {   // music_enabled: true / false (a bare JSON boolean)
+        const size_t k = text.find("\"music_enabled\"");
+        if (k != std::string::npos) {
+            const size_t c = text.find(':', k);
+            const size_t e = text.find_first_of(",\n}", c == std::string::npos ? k : c);
+            if (c != std::string::npos && e != std::string::npos) gMusicOn = text.substr(c + 1, e - c - 1).find("true") != std::string::npos;
+        }
+        gMusicTrack = JsonStringOrNull(text, "music_track");
+    }
     { const std::string gq = JsonStringOrNull(text, "graphics_quality");
       for (int q = 0; q < 3; ++q) if (gq == kQualityNames[q]) gGraphicsQuality = q; }
     { const std::string res = JsonStringOrNull(text, "resolution");
@@ -1328,8 +1579,8 @@ static void Mat4InvAffine(const float* m, float* o) {
 }
 
 static const int   kMapMenuRows = 18;   // visible rows in the ESC map picker
-static const char* kMapInfoDir = "resources/resources/mapinfo/";
-static const char* kBgDir      = "resources/resources/model/background/";
+#define kMapInfoDir RESC("resources/resources/mapinfo/")
+#define kBgDir RESC("resources/resources/model/background/")
 
 // Read one bginfo-*.ini. Sections we need: [MAPINFO] name=, [SKY] object_1=,
 // [STATIC] object_N=. Lines starting with ';' are commented-out objects.
@@ -1352,6 +1603,12 @@ static bool ReadBgInfo(const std::string& file, BgInfo& out) {
         else if (section == "SKY"    && key.rfind("object_", 0) == 0 && out.sky.empty()) out.sky = val;
         else if (section == "STATIC"  && key.rfind("object_", 0) == 0 && !val.empty()) out.statics.push_back(val);
         else if (section == "DYNAMIC" && key.rfind("object_", 0) == 0 && !val.empty()) out.dynamics.push_back(val);
+        else if (section == "ADDON_SEQUENCE" && key.rfind("object_", 0) == 0 && !val.empty()) {
+            const int n = atoi(key.c_str() + 7);
+            const bool dummy = key.size() > 6 && key.compare(key.size() - 6, 6, "_Dummy") == 0;
+            auto& slot = out.addonSeqs[n];
+            (dummy ? slot.second : slot.first) = val;
+        }
         else if (section == "BGM" && key.rfind("bgm_", 0) == 0 && val.size() > 4 &&
                  val.substr(val.size() - 4) == ".ogg") out.bgm.push_back(val);
     }
@@ -1380,9 +1637,11 @@ void WorldState::ScanMaps() {
 void WorldState::LoadMap(int index) {
     if (index < 0 || index >= (int)maps.size()) return;
     const BgInfo& bi = maps[index];
+    reslog::Note("loading map %s", bi.ini.c_str());
     mapIdx = index;
     PlayMapMusic(0);
-    map.clear(); collTris.clear();
+    ReleaseClones();   // its clones stay with the old map
+    map.clear(); collTris.clear(); mapSkyIdx = -1; mapCacheDirty = true;   // static buffers rebuilt on the next frame
 
     std::vector<std::string> files;
     if (!bi.sky.empty()) files.push_back(bi.sky);
@@ -1405,6 +1664,7 @@ void WorldState::LoadMap(int index) {
                     lo[2]=(std::min)(lo[2],v.z); hi[2]=(std::max)(hi[2],v.z);
                 }
             }
+        if (mm == bi.sky) mapSkyIdx = (int)map.size();
         map.push_back(std::move(s));
     }
     // EVERY scene stays in `map`: a .scn can hold the hull AND visible geometry, and
@@ -1431,12 +1691,76 @@ void WorldState::LoadMap(int index) {
     spawnPoints.clear();
     for (const scn::Box* b : spawns) spawnPoints.push_back({ b->matrix[12], b->matrix[13], b->matrix[14] });
     grounded = false; velY = 0.f; velX = 0.f; velZ = 0.f; camInit = false;
+
+    // [ADDON_SEQUENCE]: each .seq loops on its Dummy node of the map scenes.
+    activeEffects.erase(std::remove_if(activeEffects.begin(), activeEffects.end(),
+                        [](const ActiveEffect& e) { return e.tag == "map"; }), activeEffects.end());
+    for (const auto& kv : bi.addonSeqs) {
+        const std::string& file = kv.second.first; const std::string& dummy = kv.second.second;
+        if (file.empty()) continue;
+        const float* M = nullptr;
+        for (const scn::Scene& s : map) {
+            for (const scn::Bone& b : s.bones)   if (b.name == dummy) { M = b.matrix; break; }
+            if (!M) for (const scn::Model& m : s.models) if (m.name == dummy) { M = m.matrix; break; }
+            if (!M) for (const scn::Box& b : s.boxes)   if (b.name == dummy) { M = b.matrix; break; }
+            if (M) break;
+        }
+        if (!M && !dummy.empty()) { DbgLog("[world] addon seq '%s': node '%s' not in the map", file.c_str(), dummy.c_str()); continue; }
+        static const float kOrigin[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        if (!M) M = kOrigin;
+        const size_t before = activeEffects.size();
+        SpawnSeq("Resources/Effects/" + file, M[12], M[13], M[14], std::atan2(M[8], M[10]), "map");
+        if (activeEffects.size() > before) activeEffects.back().followActor = false;
+    }
     DbgLog("[world] map '%s' (%s): scenes=%zu collTris=%zu spawns=%zu charPos=(%.0f,%.0f,%.0f)",
            bi.name.c_str(), bi.ini.c_str(), map.size(), collTris.size(), spawns.size(),
            charPos[0], charPos[1], charPos[2]);
 }
 
+// Every .ogg of the Bgm folder, as "Bgm/<file>" (what the maps' [BGM] lists use).
+static const std::vector<std::string>& MusicTracks() {
+    static std::vector<std::string> tracks;
+    static bool built = false;
+    if (!built) {
+        built = true;
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(RESC("resources/resources/bgm/*.ogg"), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do tracks.push_back(std::string("Bgm/") + fd.cFileName); while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+        std::sort(tracks.begin(), tracks.end());
+        DbgLog("[bgm] %zu tracks in the Bgm folder", tracks.size());
+    }
+    return tracks;
+}
+
+// Turns the music on with the next / previous track of the folder and saves it.
+void WorldState::ChangeMusic(int dir) {
+    const std::vector<std::string>& tracks = MusicTracks();
+    if (tracks.empty()) return;
+    int cur = -1;
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        std::string a = tracks[i], b = gMusicTrack;
+        for (char& c : a) c = (char)std::tolower((unsigned char)c);
+        for (char& c : b) c = (char)std::tolower((unsigned char)c);
+        if (a == b) { cur = (int)i; break; }
+    }
+    const int n = (int)tracks.size();
+    const int next = cur < 0 ? (dir > 0 ? 0 : n - 1) : ((cur + dir) % n + n) % n;
+    gMusicTrack = tracks[next];
+    gMusicOn = true;
+    PlayMapMusic(0);
+    SaveWeaponSlots();
+}
+
 void WorldState::PlayMapMusic(int index) {
+    if (!gMusicOn) { audio::StopMusic(); return; }
+    if (!gMusicTrack.empty()) {   // the track chosen in the menu / config.json
+        audio::PlayMusic(gMusicTrack);
+        DbgLog("[bgm] chosen track '%s'", gMusicTrack.c_str());
+        return;
+    }
     if (mapIdx < 0 || mapIdx >= (int)maps.size() || maps[mapIdx].bgm.empty()) { audio::StopMusic(); return; }
     const auto& list = maps[mapIdx].bgm;
     bgmIndex = (index % (int)list.size() + (int)list.size()) % (int)list.size();
@@ -1456,7 +1780,7 @@ void WorldState::SpawnSeq(const std::string& relPath, float x, float y, float z,
     std::replace(fullPath.begin(), fullPath.end(), '\\', '/');
     std::string lowPath = fullPath;
     for (char& c : lowPath) c = (char)std::tolower((unsigned char)c);
-    fullPath = (lowPath.rfind("resources/", 0) == 0 ? "resources/" : "resources/resources/") + fullPath;
+    fullPath = (lowPath.rfind("resources/", 0) == 0 ? RES("resources/") : RES("resources/resources/")) + fullPath;
     seq::Sequence s = seq::Parse(fullPath.c_str());
     if (!s.ok) {
         DbgLog("[seq] '%s' FAILED to parse: %s (declared nodeCount=%u, nodes found=%zu, version=%.3f)",
@@ -1493,11 +1817,11 @@ void WorldState::SpawnSeq(const std::string& relPath, float x, float y, float z,
             // not found, lives with the effects.
             const size_t lastRes = low.rfind("resources/");
             if (lastRes != std::string::npos) rel = rel.substr(lastRes + 10);
-            if (!std::filesystem::exists("resources/resources/" + rel)) {
+            if (!std::filesystem::exists(RES("resources/resources/") + rel)) {
                 const size_t sl = rel.find_last_of('/');
                 rel = "effects/" + (sl == std::string::npos ? rel : rel.substr(sl + 1));
             }
-            scn::Scene model = scn::Parse(("resources/resources/" + rel).c_str());
+            scn::Scene model = scn::Parse((RES("resources/resources/") + rel).c_str());
             if (model.ok) { ++modelNodes; e.models.push_back({ std::move(model), n.beginTime, n.endTime, n.fadeIn, n.fadeOut, n.loaderLoop, n.animName }); }
             else DbgLog("[seq] model '%s' -> 'resources/resources/%s' failed: %s", n.modelFile.c_str(), rel.c_str(), model.error.c_str());
         }
@@ -1524,28 +1848,45 @@ void WorldState::DrawEffects(IRenderer* r, unsigned tnow, const float* previewPl
             e.pitch = 0.f;
         }
         float nodeLocal[16];
-        const bool onNode = !e.attachNode.empty() && (CostumeNodeWorld(e.attachNode, nodeLocal, &pose) ||
+        // Weapon effects: the weapon's node as drawn this frame (hand or holster).
+        auto weaponNode = [&]() {
+            if (e.tag == "costume") return false;
+            auto it = weaponNodeChar.find(e.attachNode);
+            if (it == weaponNodeChar.end()) return false;
+            std::memcpy(nodeLocal, it->second.data(), sizeof(nodeLocal));
+            return true;
+        };
+        const bool onNode = !e.attachNode.empty() && (weaponNode() || CostumeNodeWorld(e.attachNode, nodeLocal, &pose) ||
                             (!e.attachFallback.empty() && scn::BoneWorldByName(character, e.attachFallback, pose, nodeLocal)));
+        if (e.tag == "weaponfx" && !onNode) continue;   // weapon not drawn this frame: nothing at the feet
         unsigned age = (unsigned)((float)(tnow - e.startTick) * e.playbackRate);
-        if (preview) { if (e.duration > 0) age %= e.duration; }
+        if (e.frozen) age = e.frozenAge;   // a clone's copy: the instant it was left
+        else if (preview) { if (e.duration > 0) age %= e.duration; }
         else {
             // A state-owned effect (fastrun trail) replays while its state lasts.
             if (!e.tag.empty() && e.duration > 0 && age >= e.duration) { e.startTick = tnow; age = 0; }
             if (e.duration > 0 && age > e.duration + 1000) { activeEffects.erase(activeEffects.begin() + i); continue; }
         }
+        if (!e.frozen) e.lastAge = age;
         // Particles live in the effect's own space, like its model nodes: the
         // emitter cones (e.g. (0,1,-1) = forward and up) turn with the actor.
         // Adding only the position sent every spray the same world direction
         // whichever way the swing faced, off from the effect's own meshes.
         float effPos[3] = { e.x, e.y, e.z };
+        if (e.offX != 0.f || e.offZ != 0.f) {   // effect-local shift, turned with the effect
+            const float c = std::cos(e.yaw), s = std::sin(e.yaw);
+            effPos[0] += e.offX * c + e.offZ * s;
+            effPos[2] += -e.offX * s + e.offZ * c;
+        }
         float effWorld[16]; BuildYawPitchTranslate(e.yaw, e.pitch, effPos, effWorld);
         if (preview) std::memcpy(effWorld, previewPlace, sizeof(effWorld));
+        if (e.frozen && !preview) std::memcpy(effWorld, e.fixedWorld.data(), sizeof(effWorld));
         if (onNode) { float w[16]; Mat4MulS(nodeLocal, effWorld, w); std::memcpy(effWorld, w, sizeof(w)); }
         float modelEffectWorld[16]; std::memcpy(modelEffectWorld, effWorld, sizeof(effWorld));
         for (int row = 0; row < 3; ++row)
             for (int col = 0; col < 4; ++col)
                 modelEffectWorld[row*4 + col] *= e.localScale;
-        if (!preview) {
+        if (!preview && !e.frozen) {
             std::array<float, 16> m; std::memcpy(m.data(), effWorld, sizeof(effWorld));
             e.history.push_back({ tnow, m });
             while (e.history.size() > 2 && tnow - e.history.front().first > 6000) e.history.erase(e.history.begin());
@@ -1605,9 +1946,12 @@ void WorldState::DrawEffects(IRenderer* r, unsigned tnow, const float* previewPl
             // and out over the last FadeOutTime ms (gun_hit: 0-1000, 500/500).
             float fade = 1.f;
             if (em.end > em.begin) {
-                if (age < em.begin || age > em.end) continue;
+                // On from begin to end, then fading out over FadeOutTime AFTER end
+                // (skill_swordman_battack part1: 0-300 ms, fade 500; its meshes
+                // run visibility tracks to ~480 ms, so cutting at 300 clipped it).
+                if (age < em.begin || age > em.end + em.fadeOut) continue;
                 if (em.fadeIn)  fade = (std::min)(fade, (float)(age - em.begin) / (float)em.fadeIn);
-                if (em.fadeOut) fade = (std::min)(fade, (float)(em.end - age) / (float)em.fadeOut);
+                if (age > em.end && em.fadeOut) fade = (std::min)(fade, 1.f - (float)(age - em.end) / (float)em.fadeOut);
                 if (fade <= 0.f) continue;
             }
             scn::Pose effPose;
@@ -1627,9 +1971,13 @@ void WorldState::DrawEffects(IRenderer* r, unsigned tnow, const float* previewPl
                 if (const scn::Mat4* node = effNodes(m.name)) Mat4MulS(node->data(), modelEffectWorld, world);
                 else Mat4MulS(m.matrix, modelEffectWorld, world);
                 bool hasUv = m.vertices.size() == m.uv1.size();
+                // Vertex animation (the dash's slash grows by stretching its vertices).
+                std::vector<scn::Vec3> morphed;
+                const bool isMorph = scn::SampleMorphPositions(m, effPose.clipA, effPose.tickA, effPose.loopA, morphed);
+                const std::vector<scn::Vec3>& vsrc = isMorph ? morphed : m.vertices;
                 std::vector<float> pu(m.vertices.size() * 5);
                 for (size_t i = 0; i < m.vertices.size(); ++i) {
-                    pu[i*5+0]=m.vertices[i].x; pu[i*5+1]=m.vertices[i].y; pu[i*5+2]=m.vertices[i].z;
+                    pu[i*5+0]=vsrc[i].x; pu[i*5+1]=vsrc[i].y; pu[i*5+2]=vsrc[i].z;
                     pu[i*5+3]= hasUv ? m.uv1[i].u : 0.f; pu[i*5+4]= hasUv ? m.uv1[i].v : 0.f;
                 }
                 std::vector<unsigned short> idx; idx.reserve(m.faces.size() * 3);
@@ -1678,7 +2026,7 @@ static WeaponFireFuncs FindWeaponFireFuncs(const std::string& scriptDir, const s
     static const std::regex funcRe(R"(function\s+([A-Za-z0-9_]+)\s*\()");
     static const std::regex reqRe(R"(require\s*\(?\s*"([^"]+)\")");
     std::error_code ec;
-    struct Src { std::string rel, text; bool top; };
+    struct Src { std::string rel, text; bool top; std::vector<std::string> fns, reqs; };
     std::vector<Src> files;
     for (auto it = fs::recursive_directory_iterator(scriptDir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (!it->is_regular_file()) continue;
@@ -1691,14 +2039,23 @@ static WeaponFireFuncs FindWeaponFireFuncs(const std::string& scriptDir, const s
         std::ifstream f(it->path(), std::ios::binary);
         if (!f) continue;
         std::ostringstream ss; ss << f.rdbuf();
-        files.push_back({ rel, ss.str(), top });
+        Src src{ rel, ss.str(), top, {}, {} };
+        if (luaw::IsBytecodeFile(it->path().string())) {
+            // Compiled script (vanilla resources): what it defines and requires, by running it.
+            const luaw::ScriptScan& scan = luaw::ScanScript(it->path().string());
+            src.fns = scan.functions; src.reqs = scan.requires_;
+        } else {
+            for (auto m = std::sregex_iterator(src.text.begin(), src.text.end(), funcRe); m != std::sregex_iterator(); ++m) src.fns.push_back((*m)[1].str());
+            for (auto m = std::sregex_iterator(src.text.begin(), src.text.end(), reqRe); m != std::sregex_iterator(); ++m) src.reqs.push_back((*m)[1].str());
+        }
+        files.push_back(std::move(src));
     }
     // subfolder file -> top-level weapon file that requires it
     std::map<std::string, std::string> requiredBy;
     for (const Src& f : files) {
         if (!f.top) continue;
-        for (auto it = std::sregex_iterator(f.text.begin(), f.text.end(), reqRe); it != std::sregex_iterator(); ++it) {
-            std::string r = (*it)[1].str();
+        for (const std::string& rq : f.reqs) {
+            std::string r = rq;
             for (char& c : r) { if (c == '\\') c = '/'; c = (char)tolower((unsigned char)c); }
             for (const char* pre : { "resources/script/", "script/" }) if (r.rfind(pre, 0) == 0) { r = r.substr(strlen(pre)); break; }
             requiredBy.emplace(r, f.rel);
@@ -1709,11 +2066,10 @@ static WeaponFireFuncs FindWeaponFireFuncs(const std::string& scriptDir, const s
         std::string lowRel = f.rel; for (char& c : lowRel) c = (char)tolower((unsigned char)c);
         auto rb = requiredBy.find(lowRel);
         const std::string runFile = f.top ? f.rel : (rb != requiredBy.end() ? rb->second : f.rel);
-        for (auto it = std::sregex_iterator(f.text.begin(), f.text.end(), funcRe); it != std::sregex_iterator(); ++it) {
-            std::string fn = (*it)[1].str();
-            if (fn.find(weaponStates) == std::string::npos) continue;
+        for (const std::string& fn : f.fns) {
             if (out.fileOf.count(fn)) continue;
-            out.fileOf[fn] = runFile;
+            out.fileOf[fn] = runFile;   // every function: the item rows name any of them
+            if (fn.find(weaponStates) == std::string::npos) continue;
             if (fn.find("StandAttack_Strong1") != std::string::npos) strong1C.push_back(fn);
             else if (fn.find("StandAttack_Strong") != std::string::npos) strongC.push_back(fn);
             else if (fn.find("StandAttack_Weak") != std::string::npos) weakC.push_back(fn);
@@ -1781,6 +2137,8 @@ void WorldState::EquipWeapon(int slot) {
     if (slot < 0 || slot >= (int)gLoadout.size()) {   // fuera de rango = desarmado
         weaponSlot = -1; weaponOk = false; weapon = scn::Scene(); weaponStates.clear();
         weaponPieceWorlds.clear(); weaponParts.clear(); weaponTypeId.reset();
+        activeEffects.erase(std::remove_if(activeEffects.begin(), activeEffects.end(),
+                            [](const ActiveEffect& e) { return e.tag == "weaponfx"; }), activeEffects.end());
         animCtrl.LoadFromLua(luaStates, "");
         return;
     }
@@ -1792,9 +2150,19 @@ void WorldState::EquipWeapon(int slot) {
 // first listing wins): its <ability type> and its weapon_lua.x7 rows.
 struct SceneItem {
     long key = 0; int type = -1; std::string normal, run, attack, second;   // second = <scene value2>
+    std::string gunState;   // left_attack ani=UseWeapon1State_<X>: a gun's own weapon type suffix
     std::string fireFunc;   // left_attack weapon= (the gun's Lua fire function)
     std::string crosshair;  // <resources crosshair_file>
-    float rate = 0.f, range = 0.f; int mag = 0; std::string reloadSound;   // <ability>, <resources reload_sound_file>
+    float rate = 0.f, range = 0.f, power = 0.f; int mag = 0; std::string reloadSound;   // <ability>, <resources reload_sound_file>
+    anim::ItemLuaRows rows;   // every weapon_lua.x7 row: state -> weapon= / ani=
+    // <sequence node_name_i file_name_i> (weapon file 1) and <sequence2
+    // node_name_2_i file_name_2_i> (file 2): effects that live on nodes of
+    // the weapon while it is equipped (guillotine's cs_hand_dummy, lightning
+    // sword's Effect_Dummy01..03). An entry with no node is not hung anywhere
+    // (the sigma's body change/un-change: played by its transform).
+    struct NodeSeq { std::string node, file; int part = 0; };
+    std::vector<NodeSeq> nodeSeqs;
+    std::string otherType, attackSeq, attackOgg;   // <other_effects other_type attack_seq attack_ogg>
 };
 static const SceneItem* SceneItemOf(const std::string& scnFile) {
     static std::unordered_map<std::string, SceneItem> byScene;
@@ -1802,13 +2170,23 @@ static const SceneItem* SceneItemOf(const std::string& scnFile) {
     if (!loaded) {
         loaded = true;
         std::unordered_map<long, SceneItem> byKey;
-        const std::string lua = ReadTextFile("resources/xml/weapon_lua.x7");
+        const std::string lua = ReadTextFile(RESC("resources/xml/weapon_lua.x7"));
         for (size_t p = 0; (p = lua.find("<lua_func item_key=\"", p)) != std::string::npos; ) {
             p += 20;
             const long k = strtol(lua.c_str() + p, nullptr, 10);
             const size_t e = lua.find("/>", p);
             const std::string tag = lua.substr(p, e - p);
             p = e;
+            auto attr = [&](const char* name) {
+                const std::string key = std::string(" ") + name + "=\"";
+                const size_t q = tag.find(key);
+                return q == std::string::npos ? std::string() : tag.substr(q + key.size(), tag.find('"', q + key.size()) - q - key.size());
+            };
+            const std::string rowState = attr("state");
+            if (!rowState.empty()) {
+                anim::ItemLuaRow& row = byKey[k].rows[rowState];
+                row.weapon = attr("weapon"); row.ani = attr("ani");
+            }
             const size_t a = tag.find("ani=\"");
             if (a == std::string::npos) continue;
             const std::string ani = tag.substr(a + 5, tag.find('"', a + 5) - a - 5);
@@ -1819,13 +2197,14 @@ static const SceneItem* SceneItemOf(const std::string& scnFile) {
             else if (tag.find("state=\"left_attack\"") != std::string::npos) {
                 const size_t w = tag.find("weapon=\"");
                 if (w != std::string::npos) it.fireFunc = tag.substr(w + 8, tag.find('"', w + 8) - w - 8);
+                it.gunState = after("UseWeapon1State_");
             }
             else if (tag.find("state=\"left_weak\"") != std::string::npos) {
                 const std::string rest = after("State_");   // SwordAtkWeakState_PlasmaSword[_Lightsaber_Kylo]
                 it.attack = rest.substr(0, rest.find('_'));
             }
         }
-        for (const char* path : { "resources/xml/_eu_weapon.x7", "resources/resources/xbn/weapon.xml" }) {
+        for (const char* path : { RESC("resources/xml/_eu_weapon.x7"), RESC("resources/resources/xbn/weapon.xml") }) {
             const std::string x = ReadTextFile(path);
             for (size_t p = 0; (p = x.find("<weapon item_key=\"", p)) != std::string::npos; ) {
                 const long k = strtol(x.c_str() + p + 18, nullptr, 10);
@@ -1847,12 +2226,31 @@ static const SceneItem* SceneItemOf(const std::string& scnFile) {
                     return q == std::string::npos ? 0.f : (float)atof(blk.c_str() + q + key.size());
                 };
                 si.rate = num(" rate_of_fire"); si.range = num(" range"); si.mag = (int)num(" magazine_capacity");
+                si.power = num(" power");
                 const size_t xh = blk.find("crosshair_file=\"");
                 if (xh != std::string::npos) si.crosshair = blk.substr(xh + 16, blk.find('"', xh + 16) - xh - 16);
                 const size_t rs = blk.find("reload_sound_file=\"");
                 if (rs != std::string::npos) si.reloadSound = blk.substr(rs + 19, blk.find('"', rs + 19) - rs - 19);
                 const size_t v2 = blk.find("value2=\"");
                 if (v2 != std::string::npos) si.second = blk.substr(v2 + 8, blk.find('"', v2 + 8) - v2 - 8);
+                auto tagAttr = [&](const char* tagName, const std::string& name) -> std::string {
+                    const size_t t0 = blk.find(std::string("<") + tagName + " ");
+                    if (t0 == std::string::npos) return std::string();
+                    const size_t t1 = blk.find("/>", t0);
+                    const std::string tg = blk.substr(t0, t1 == std::string::npos ? std::string::npos : t1 - t0);
+                    const std::string key = " " + name + "=\"";
+                    const size_t q = tg.find(key);
+                    return q == std::string::npos ? std::string() : tg.substr(q + key.size(), tg.find('"', q + key.size()) - q - key.size());
+                };
+                for (int i = 1; i <= 16; ++i) {
+                    const std::string file = tagAttr("sequence", "file_name_" + std::to_string(i));
+                    if (!file.empty()) si.nodeSeqs.push_back({ tagAttr("sequence", "node_name_" + std::to_string(i)), file, 0 });
+                    const std::string file2 = tagAttr("sequence2", "file_name_2_" + std::to_string(i));
+                    if (!file2.empty()) si.nodeSeqs.push_back({ tagAttr("sequence2", "node_name_2_" + std::to_string(i)), file2, 1 });
+                }
+                si.otherType = tagAttr("other_effects", "other_type");
+                si.attackSeq = tagAttr("other_effects", "attack_seq");
+                si.attackOgg = tagAttr("other_effects", "attack_ogg");
                 byScene.emplace(f, si);
             }
         }
@@ -1881,7 +2279,7 @@ static const HudLayout& GetHudLayout() {
     static HudLayout h;
     if (h.loaded) return h;
     h.loaded = true;
-    const std::string x = ReadTextFile("resources/resources/gui/new/maingame_ingame.xui");
+    const std::string x = ReadTextFile(RESC("resources/resources/gui/new/maingame_ingame.xui"));
     auto rectOf = [&](size_t at, int& l, int& t, int& r, int& b) {
         const size_t g = x.find("<global ", at); if (g == std::string::npos) return false;
         auto num = [&](const char* k) { const size_t q = x.find(std::string(k) + "=\"", g); return q == std::string::npos ? 0 : atoi(x.c_str() + q + strlen(k) + 2); };
@@ -1911,6 +2309,9 @@ static const HudLayout& GetHudLayout() {
 // Third-person camera: the view centre (crosshair) at head top - the original
 // keeps it just over the head (Bip01 HeadNub: male y 279, female 269) - and
 // sideoffset 130 over the shoulder.
+// Camera pitch limits (rad, + = looking down): 77 degrees up, 69 down. The old
+// 20 degrees up kept the eye above the ground; the camera now collides instead.
+static const float kPitchUp = -1.35f, kPitchDown = 1.2f;
 static const float kCamHeightOffset = 280.f, kCamSideOffset = 130.f;
 
 // weapon_type_reload_info.x7: <weapon_type type="N"><normal reload_period="ms">.
@@ -1919,7 +2320,7 @@ static unsigned ReloadPeriodOfType(int type) {
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
-        const std::string x = ReadTextFile("resources/xml/weapon_type_reload_info.x7");
+        const std::string x = ReadTextFile(RESC("resources/xml/weapon_type_reload_info.x7"));
         for (size_t p = 0; (p = x.find("<weapon_type type=\"", p)) != std::string::npos; ) {
             const int t = atoi(x.c_str() + p + 19);
             const size_t e = x.find("</weapon_type>", p);
@@ -1959,16 +2360,16 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
     const bool splitWeapon = SplitWeaponPair(requestedStem, rightStem, leftStem);
     if (splitWeapon) {
         const std::string rightFile = rightStem + ".scn";
-        if (std::filesystem::exists(std::filesystem::path("resources/resources/model/weapon") / rightFile))
+        if (std::filesystem::exists(std::filesystem::path(RES("resources/resources/model/weapon")) / rightFile))
             primaryFile = rightFile; // sceneIndex 0 is always the right piece.
     }
-    weapon = scn::Parse((std::string("resources/resources/model/weapon/") + primaryFile).c_str());
+    weapon = scn::Parse((std::string(RES("resources/resources/model/weapon/")) + primaryFile).c_str());
     // Iron Boots: the x7 scene (ironboots_01.scn) is not a weapon model - the
     // boots are model/character/foot/<name>_foot.scn, skinned to the
     // character's calves and feet. Worn like a costume part, not held.
     bool wornWeapon = false;
     if (!weapon.ok || weapon.models.empty()) {
-        const std::string worn = "resources/resources/model/character/foot/" + requestedStem + "_foot.scn";
+        const std::string worn = RES("resources/resources/model/character/foot/") + requestedStem + "_foot.scn";
         if (std::filesystem::exists(worn)) {
             scn::Scene w = scn::Parse(worn.c_str());
             if (w.ok && !w.models.empty()) { weapon = std::move(w); wornWeapon = true; DbgLog("[weapon] '%s' is worn: %s", scnName, worn.c_str()); }
@@ -2044,8 +2445,52 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
     // PlasmaSword), while idle and run may borrow another weapon's
     // (NormalState_SpyDagger, RunState_Katana_A_Sword).
     std::string normalAs, runAs;
+    weaponRows.clear();
+    weaponItemRange = weaponItemPower = 0.f;
+    luaw::SetWeaponRange(0.f);
+    weaponAttackSeq.clear(); weaponAttackOgg.clear();
+    activeEffects.erase(std::remove_if(activeEffects.begin(), activeEffects.end(),
+                        [](const ActiveEffect& e) { return e.tag == "weaponfx"; }), activeEffects.end());
     if (const SceneItem* si = SceneItemOf(requestedFile)) {
-        if (!si->attack.empty() && luaStates.attackMap().typeBySuffix.count(si->attack)) weaponStates = si->attack;
+        weaponRows = si->rows;
+        weaponItemRange = si->range; weaponItemPower = si->power;
+        luaw::SetWeaponRange(weaponItemRange);
+        // The item's own effects on its weapon nodes, looped while equipped.
+        for (const SceneItem::NodeSeq& ns : si->nodeSeqs) {
+            if (ns.node.empty()) continue;
+            const size_t before = activeEffects.size();
+            SpawnSeq("Resources/Effects/" + ns.file, charPos[0], charPos[1], charPos[2], charYaw + 3.14159265f, "weaponfx");
+            if (activeEffects.size() > before) {
+                activeEffects.back().attachNode = ns.node;
+                // Skeleton bones (sigma's Bip01 buff) hang off the body.
+                if (ns.node.rfind("Bip01", 0) == 0) activeEffects.back().attachFallback = ns.node;
+            }
+            DbgLog("[weaponfx] item %ld node '%s' seq '%s' %s", si->key, ns.node.c_str(), ns.file.c_str(),
+                   activeEffects.size() > before ? "spawned" : "FAILED");
+        }
+        if (si->otherType == "counter_sword") { weaponAttackSeq = si->attackSeq; weaponAttackOgg = si->attackOgg; }
+        // <sequence> entries with no node: the shape change's own effects - the
+        // first on transforming, the second on reverting (sigmablade_body_change
+        // / sigmablade_body_un_change).
+        weaponChangeOnSeq.clear(); weaponChangeOffSeq.clear();
+        for (const SceneItem::NodeSeq& ns : si->nodeSeqs) {
+            if (!ns.node.empty()) continue;
+            if (weaponChangeOnSeq.empty()) weaponChangeOnSeq = ns.file;
+            else if (weaponChangeOffSeq.empty()) weaponChangeOffSeq = ns.file;
+        }
+        // The item's own rows name its weapon type: left_weak for swords
+        // (SwordAtkWeakState_X), left_attack for guns (UseWeapon1State_X).
+        // The menu's token guess for the .scn only fills in when they do not.
+        // A suffix the dispatch tables do not list takes its WEAPONTYPE from the
+        // item's <ability type> (assault / homing / spark rifles, turrets...).
+        const int abilityType = si->type;
+        const std::string abilityName = abilityType >= 0 ? data::WeaponTypeName(respath::Root(), abilityType) : std::string();
+        std::string cand = !si->attack.empty() ? si->attack : !si->gunState.empty() ? si->gunState
+                         : (!si->fireFunc.empty() ? si->normal : std::string());
+        if (!cand.empty()) {
+            luaStates.AddTypeSuffix(cand, abilityName);
+            if (luaStates.attackMap().typeBySuffix.count(cand)) weaponStates = cand;
+        }
         if (!si->normal.empty() && si->normal != weaponStates) normalAs = si->normal;
         if (!si->run.empty() && si->run != weaponStates) runAs = si->run;
         if (weaponStates != (states ? states : "") || !normalAs.empty() || !runAs.empty())
@@ -2053,15 +2498,20 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
                    normalAs.empty() ? weaponStates.c_str() : normalAs.c_str(), runAs.empty() ? weaponStates.c_str() : runAs.c_str());
     }
     weaponOk = true;
+    // A new weapon starts untransformed (sigma blade shape change).
+    anim::SetShapeChange(false); weaponChangePending = false;
+    weaponNormalAs = normalAs; weaponRunAs = runAs;
     int n = animCtrl.LoadFromLua(luaStates, weaponStates.c_str(), normalAs.c_str(), runAs.c_str());
     animCtrl.ForceRefresh();   // apply the new weapon's pose immediately, even mid-run/walk
-    weaponAnim = anim::ResolveWeaponAnim(luaStates.parsed(), weaponStates, &luaStates.attackMap(), &luaStates.attribMap());
-    atkParam = nullptr; weakCombo = 0;   // clear any attack still playing from the previous weapon
+    weaponAnim = anim::ResolveWeaponAnim(luaStates.parsed(), weaponStates, &luaStates.attackMap(), &luaStates.attribMap(),
+                                         weaponRows.empty() ? nullptr : &weaponRows);
+    ghostTrail = nullptr; ghostSamples.clear();
+    atkParam = nullptr; weakCombo = 0; swingAttacks = nullptr;   // clear any attack still playing from the previous weapon
     weapon2Active = false; weapon2IsJump = false; weapon2DropApplied = false; weapon2Phase = 0;
     // Real per-piece bone table (weapon_attach.x7) needs the weapon's numeric
     // WEAPONTYPE_* - resolved from its Lua suffix via the same dispatch table
     // used for attacks/combos.
-    weaponTypeId = data::TypeFromSuffix("resources", weaponStates, luaStates.attackMap().typeBySuffix);
+    weaponTypeId = data::TypeFromSuffix(respath::Root(), weaponStates, luaStates.attackMap().typeBySuffix);
     // Suffix with no ActorState_Normal dispatch row (RESCUE_GUN ->
     // WEAPONTYPE_RESCUEGUN, DemonicKnuckle): the item's own <ability type>
     // (_eu_weapon.x7 / xbn weapon.xml) is the WEAPONTYPE_* index itself.
@@ -2082,7 +2532,7 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
         if (gunMag <= 0) gunMag = 30;
         gunAmmo = gunMag;
         gunReloadMs = weaponTypeId ? ReloadPeriodOfType(*weaponTypeId) : 2000u;
-        gunHasOrigin = false; gunAnimMs = 0.f; gunRays.clear(); gunShotIndex = 0;
+        gunHasOrigin = false; gunAnimMs = 0.f; gunRays.clear(); gunRayGroups = 1; gunRoundOffsets.clear(); gunPendingRounds.clear(); gunShotIndex = 0;
         if (const SceneItem* si = SceneItemOf(requestedFile)) if (!si->fireFunc.empty()) {
             // The function lives in one of the weapon_*.lua files.
             const std::string scriptDir = ScriptDir();
@@ -2090,17 +2540,48 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
             WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA((scriptDir + "/weapon_*.lua").c_str(), &fd);
             if (h != INVALID_HANDLE_VALUE) {
                 do {
-                    const std::string txt = ReadTextFile((scriptDir + "/" + fd.cFileName).c_str());
+                    const std::string path = scriptDir + "/" + fd.cFileName;
+                    if (luaw::IsBytecodeFile(path)) {
+                        const luaw::ScriptScan& scan = luaw::ScanScript(path);
+                        if (std::find(scan.functions.begin(), scan.functions.end(), si->fireFunc) != scan.functions.end()) { file = fd.cFileName; break; }
+                        continue;
+                    }
+                    const std::string txt = ReadTextFile(path.c_str());
                     if (txt.find("function " + si->fireFunc + "(") != std::string::npos) { file = fd.cFileName; break; }   // relative: RunWeaponFire prepends scriptDir
                 } while (FindNextFileA(h, &fd));
                 FindClose(h);
             }
             if (!file.empty()) {
                 luaw::WeaponFireState st;
-                const auto attacks = luaw::RunWeaponFire(scriptDir.c_str(), "third_party/lua_weapon_shim.lua", file.c_str(), si->fireFunc.c_str(), 0, 0, 0, 0, &st);
+                auto runFire = [&](float oneShot, luaw::WeaponFireState* out) {
+                    return luaw::RunWeaponFire(scriptDir.c_str(), "third_party/lua_weapon_shim.lua", file.c_str(), si->fireFunc.c_str(), oneShot, 0, 0, 0, out);
+                };
+                auto distinctTimes = [](const std::vector<luaw::WeaponAttack>& a) {
+                    std::vector<float> t;
+                    for (const auto& x : a) if (x.shape.kind == "ray" && std::find(t.begin(), t.end(), x.fireTime) == t.end()) t.push_back(x.fireTime);
+                    return t.size();
+                };
+                // A burst: the attacks carry their own fireTimes (SMG2 3 rounds at
+                // 10/65/120 ms) or scale them by OneShotTime (machine gun, turret:
+                // (i-1) * OneShotTime). Probe both; the scaled ones are fitted
+                // into the state's normal time (InitLua arg 1).
+                luaw::WeaponFireState st0;
+                auto attacks = runFire(0.f, &st0);
+                size_t nRays = 0; for (const auto& x : attacks) if (x.shape.kind == "ray") ++nRays;
+                if (nRays > 1 && distinctTimes(attacks) <= 1) {
+                    luaw::WeaponFireState stp;
+                    const auto probe = runFire(100.f, &stp);
+                    if (distinctTimes(probe) > 1) {
+                        const float normalMs = st0.initArgs.empty() ? 750.f : st0.initArgs[0];
+                        const float oneShot = (std::min)(143.f, (std::max)(30.f, normalMs / (float)nRays));
+                        attacks = runFire(oneShot, &st);
+                        DbgLog("[gun] burst scaled by OneShotTime: %zu rounds in %.0f ms (normal %.0f)", nRays, oneShot * (nRays - 1), normalMs);
+                    } else attacks = runFire(0.f, &st);
+                } else attacks = runFire(0.f, &st);
                 for (const luaw::WeaponAttack& wa : attacks) {
                     if (wa.shape.kind != "ray" || wa.shape.dirZ > -1e-4f) continue;
                     GunRay gr; gr.x = wa.shape.dirX / -wa.shape.dirZ; gr.y = wa.shape.dirY / -wa.shape.dirZ;
+                    gr.fireTime = wa.fireTime;
                     if (wa.push.size() >= 3) { gr.pushMs = wa.push[0]; gr.pushSpeed = wa.push[1]; gr.pushAccel = wa.push[2]; }
                     for (size_t k = 0; k + 2 < wa.offsets.size(); k += 3) {
                         const float z = wa.offsets[k + 2] < -1e-4f ? -wa.offsets[k + 2] : 1.f;
@@ -2108,7 +2589,20 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
                     }
                     gunRays.push_back(std::move(gr));
                 }
-                DbgLog("[gun] rays per shot=%zu pattern=%zu push[0]=(%.0fms, %.0f, %.0f)", gunRays.size(), gunRays.empty() ? (size_t)0 : gunRays[0].off.size() / 2,
+                // Attacks sharing a fireTime go out together (revolver 4 rays,
+                // shotgun 7 pellets); different fireTimes are a SEQUENCE - the
+                // machine gun's 20 spread rays are 20 consecutive shots, one
+                // per trigger tick, cycling.
+                {
+                    std::vector<float> times;
+                    for (const GunRay& g : gunRays) if (std::find(times.begin(), times.end(), g.fireTime) == times.end()) times.push_back(g.fireTime);
+                    std::sort(times.begin(), times.end());
+                    gunRayGroups = (int)(std::max)((size_t)1, times.size());
+                    gunRoundOffsets.clear();
+                    for (float t : times) gunRoundOffsets.push_back(t - (times.empty() ? 0.f : times.front()));
+                    for (GunRay& g : gunRays) g.group = (int)(std::find(times.begin(), times.end(), g.fireTime) - times.begin());
+                }
+                DbgLog("[gun] ray groups=%d, rays %zu, pattern=%zu push[0]=(%.0fms, %.0f, %.0f)", gunRayGroups, gunRays.size(), gunRays.empty() ? (size_t)0 : gunRays[0].off.size() / 2,
                        gunRays.empty() ? 0.f : gunRays[0].pushMs, gunRays.empty() ? 0.f : gunRays[0].pushSpeed, gunRays.empty() ? 0.f : gunRays[0].pushAccel);
                 if (st.loaded && st.initArgs.size() >= 6) {
                     gunHeight = st.initArgs[0]; gunSide0 = st.initArgs[1]; gunSide1 = st.initArgs[2];
@@ -2146,7 +2640,7 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
         if (!weaponAnim.gunTracerSeq.empty()) {
             std::string p = weaponAnim.gunTracerSeq; std::replace(p.begin(), p.end(), '\\', '/');
             std::string low = p; for (char& c : low) c = (char)std::tolower((unsigned char)c);
-            p = (low.rfind("resources/", 0) == 0 ? "resources/" : "resources/resources/") + p;
+            p = (low.rfind("resources/", 0) == 0 ? RES("resources/") : RES("resources/resources/")) + p;
             const seq::Sequence ts = seq::Parse(p.c_str());
             for (const seq::Node& n : ts.nodes)
                 if (n.isLightning) gunBeamNodes.push_back({ n.beam, n.beginTime, n.endTime });
@@ -2171,15 +2665,15 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
     const int primaryRow = (!splitWeapon && mount && mount->name == "Counter_Sword_Dummy") ? 1 : 0;
     primary.sceneIndex = primaryRow;
     if (mount) primary.mountName = mount->name;
-    primary.attackBone = weaponTypeId ? data::AttachBone("resources", *weaponTypeId, primaryRow, false) : "";
+    primary.attackBone = weaponTypeId ? data::AttachBone(respath::Root(), *weaponTypeId, primaryRow, false) : "";
     if (primary.attackBone.empty()) primary.attackBone = primaryRow ? std::string("L_Hand_Dummy") : weaponBone;
-    primary.idleBone = weaponTypeId ? data::AttachBone("resources", *weaponTypeId, primaryRow, true) : "";
+    primary.idleBone = weaponTypeId ? data::AttachBone(respath::Root(), *weaponTypeId, primaryRow, true) : "";
     if (primary.idleBone.empty()) primary.idleBone = primary.attackBone;
     // link=1 pieces go through CWeapon::LoadAttachWeaponModel (sub_71E8C0):
     // every child of the SCN root is hung from the bone with its authored
     // transform - no Wea_Dummy, nothing cancelled. Only link=0 pieces
     // (LoadWeaponModel) hang by their mount dummy.
-    if (weaponTypeId && data::AttachLink("resources", *weaponTypeId, primaryRow) == 1) {
+    if (weaponTypeId && data::AttachLink(respath::Root(), *weaponTypeId, primaryRow) == 1) {
         const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         std::memcpy(primary.invMount, id, sizeof(id));
         primary.mountName.clear();
@@ -2200,7 +2694,7 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
     // A link=1 row of weapon_attach.x7 already names the bone and hangs the
     // piece as authored (mind_alice, Mind Storm: Bip01 R Forearm) - the rule
     // matched its doll's Bip07 to Bip01 L Toe0 and left it on the floor.
-    if (rigRoot && weaponTypeId && data::AttachLink("resources", *weaponTypeId, primaryRow) == 1) rigRoot = nullptr;
+    if (rigRoot && weaponTypeId && data::AttachLink(respath::Root(), *weaponTypeId, primaryRow) == 1) rigRoot = nullptr;
     if (rigRoot) {
         const scn::Bone* mount = rigRoot;
         const float* M = mount->matrix;
@@ -2231,7 +2725,7 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
         weaponWornParts.push_back(weapon);
         // ...and its leg part: ironboots_01_leg.scn carries the shin armour
         // (without it the costume's bare shins showed between the plates).
-        const std::string leg = "resources/resources/model/character/leg/" + requestedStem + "_leg.scn";
+        const std::string leg = RES("resources/resources/model/character/leg/") + requestedStem + "_leg.scn";
         if (std::filesystem::exists(leg)) {
             scn::Scene l = scn::Parse(leg.c_str());
             if (l.ok && !l.models.empty()) { l.costumeSlot = 3; weaponWornParts.push_back(std::move(l)); }
@@ -2245,12 +2739,12 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
     // always the _r name turned into _l. The name rule stays as the fallback.
     std::string leftName = splitWeapon ? leftStem + ".scn" : std::string();
     if (const SceneItem* si = SceneItemOf(requestedFile))
-        if (!si->second.empty() && std::filesystem::exists(std::filesystem::path("resources/resources/model/weapon") / si->second) &&
-            !(weaponTypeId && data::AttachLink("resources", *weaponTypeId, 1) == 2))   // link=2: sigmablade's _change form, shown only when it transforms
+        if (!si->second.empty() && std::filesystem::exists(std::filesystem::path(RES("resources/resources/model/weapon")) / si->second) &&
+            !(weaponTypeId && data::AttachLink(respath::Root(), *weaponTypeId, 1) == 2))   // link=2: sigmablade's _change form, shown only when it transforms
             leftName = si->second;
     if (!leftName.empty()) {
         const std::string leftFile = leftName;
-        const std::filesystem::path leftPath = std::filesystem::path("resources/resources/model/weapon") / leftFile;
+        const std::filesystem::path leftPath = std::filesystem::path(RES("resources/resources/model/weapon")) / leftFile;
         if (std::filesystem::exists(leftPath) && leftFile != primaryFile) {
             WeaponRenderPart left;
             left.sceneIndex = 1;
@@ -2274,13 +2768,13 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
                 if (!mount && !roots.empty()) mount = roots[0];
                 if (mount) scn::WeaponMountInverse(left.scene, *mount, left.invMount);
                 scn::ResolveWeaponPieceWorlds(left.scene, left.pieceWorlds);
-                left.attackBone = weaponTypeId ? data::AttachBone("resources", *weaponTypeId, 1, false) : "";
+                left.attackBone = weaponTypeId ? data::AttachBone(respath::Root(), *weaponTypeId, 1, false) : "";
                 if (left.attackBone.empty()) left.attackBone = "L_Hand_Dummy";
-                left.idleBone = weaponTypeId ? data::AttachBone("resources", *weaponTypeId, 1, true) : "";
+                left.idleBone = weaponTypeId ? data::AttachBone(respath::Root(), *weaponTypeId, 1, true) : "";
                 if (left.idleBone.empty()) left.idleBone = left.attackBone;
                 // Fixed piece (counter sword fist on Bip01 L Forearm, ...):
                 // LoadAttachWeaponModel - hangs as authored, no mount inverse.
-                if (weaponTypeId && data::AttachLink("resources", *weaponTypeId, 1) == 1) {
+                if (weaponTypeId && data::AttachLink(respath::Root(), *weaponTypeId, 1) == 1) {
                     const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
                     std::memcpy(left.invMount, id, sizeof(id));
                 }
@@ -2316,17 +2810,43 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
         const std::string scriptDir = ScriptDir();
         const std::string shimPath = "third_party/lua_weapon_shim.lua";
         WeaponFireFuncs ff = FindWeaponFireFuncs(scriptDir, weaponStates);
+        // The item's rows name its attack functions (weapon=): the counter
+        // sword's StandardCounterSwordAfterDash1 / CounterAttack / JumpDash,
+        // the sigma skins' StandardSigmaBladeAfterDash1 for magmaBlade...
+        // Name guessing above only fills states the item does not list.
+        {
+            auto rowWeapon = [&](const char* st) -> std::string {
+                auto it = weaponRows.find(st);
+                return it != weaponRows.end() && ff.fileOf.count(it->second.weapon) ? it->second.weapon : std::string();
+            };
+            auto take = [](std::string& dst, const std::string& v) { if (!v.empty()) dst = v; };
+            std::string w = rowWeapon("left_weak");
+            if (w.empty() && !weaponAnim.isGun) w = rowWeapon("left_attack");   // daggers: StandardSpyDaggerAttack1 (a gun's is its shot)
+            take(ff.weak, w);
+            take(ff.strong, rowWeapon("left_strong1"));
+            take(ff.strong1, rowWeapon("left_strong2"));
+            take(ff.weapon2, rowWeapon("right_attack"));
+            take(ff.jump, rowWeapon("left_jump"));
+            if (!ff.weak.empty()) ff.file = ff.FileFor(ff.weak);
+        }
         atkSeqWeak.clear(); atkSeqStrong.clear(); atkSeqStrong1.clear(); pendingSeqs.clear();
+        ghostTrail = nullptr; ghostSamples.clear();
         atkMoveBoxWeak = atkMoveBoxStrong = atkMoveBoxStrong1 = 1.f;
         atkNormalMsWeak = atkNormalMsStrong = atkNormalMsStrong1 = 0.f;
         atkDelayMsWeak = atkDelayMsStrong = atkDelayMsStrong1 = 0.f;
         bool lastUseMoveBox = false;
+        // The weapon's own range (WEAPON:GetRange) and power (the Power argument)
+        // from its item, so every CreateCAttack box/ray/fan has its real size.
+        luaw::SetWeaponRange(weaponItemRange);
+        atkLuaWeak.clear(); atkLuaStrong.clear(); atkLuaStrong1.clear(); weapon2Attacks.clear(); jumpAttacks.clear();
+        std::vector<luaw::WeaponAttack>* attacksOut = nullptr;
         auto tryFunc = [&](const std::string& fn, float& outRate, float& outHitStop,
                            std::vector<luaw::WeaponFireState::Sequence>& outSeqs, float& outMoveBox,
                            float& outNormalMs, float& outDelayMs) {
             if (fn.empty()) return;
             luaw::WeaponFireState st;
-            luaw::RunWeaponFire(scriptDir.c_str(), shimPath.c_str(), ff.FileFor(fn).c_str(), fn.c_str(), 0, 0, 0, 0, &st);
+            std::vector<luaw::WeaponAttack> atks = luaw::RunWeaponFire(scriptDir.c_str(), shimPath.c_str(), ff.FileFor(fn).c_str(), fn.c_str(), 0, weaponItemPower, 0, 0, &st);
+            if (attacksOut) *attacksOut = std::move(atks);
             outRate = st.moveSpeedRate; outHitStop = st.hitStopA;
             outSeqs = st.sequences;
             outMoveBox = st.moveBoxMultiplier;
@@ -2334,24 +2854,36 @@ void WorldState::EquipWeaponFile(const char* scnName, const char* states) {
             lastUseMoveBox = st.useMoveBox;
         };
         atkUseMoveBoxWeak = atkUseMoveBoxStrong = atkUseMoveBoxStrong1 = false;
+        attacksOut = &atkLuaWeak;
         lastUseMoveBox = false; tryFunc(ff.weak, atkMoveSpeedRateWeak, atkHitStopWeak, atkSeqWeak, atkMoveBoxWeak, atkNormalMsWeak, atkDelayMsWeak);
         atkUseMoveBoxWeak = lastUseMoveBox;
+        attacksOut = &atkLuaStrong;
         lastUseMoveBox = false; tryFunc(ff.strong, atkMoveSpeedRateStrong, atkHitStopStrong, atkSeqStrong, atkMoveBoxStrong, atkNormalMsStrong, atkDelayMsStrong);
         atkUseMoveBoxStrong = lastUseMoveBox;
+        attacksOut = &atkLuaStrong1;
         lastUseMoveBox = false; tryFunc(ff.strong1, atkMoveSpeedRateStrong1, atkHitStopStrong1, atkSeqStrong1, atkMoveBoxStrong1, atkNormalMsStrong1, atkDelayMsStrong1);
         atkUseMoveBoxStrong1 = lastUseMoveBox;
         DbgLog("[weapon-lua] swing moveSpeedRate weak=%.2f strong=%.2f useMoveBox weak=%d strong=%d",
                atkMoveSpeedRateWeak, atkMoveSpeedRateStrong, (int)atkUseMoveBoxWeak, (int)atkUseMoveBoxStrong);
         DbgLog("[weapon-lua] swing timing weak=%.0f+%.0f strong=%.0f+%.0f strong1=%.0f+%.0f ms",
                atkNormalMsWeak, atkDelayMsWeak, atkNormalMsStrong, atkDelayMsStrong, atkNormalMsStrong1, atkDelayMsStrong1);
+        // Combo hits 2..5 (left_attack2..5 weapon=: counter sword AfterDash2..4)
+        // each run their own function.
+        atkLuaCombo.clear();
+        for (const char* stName : { "left_attack2", "left_attack3", "left_attack4", "left_attack5" }) {
+            auto it = weaponRows.find(stName);
+            if (it == weaponRows.end() || !ff.fileOf.count(it->second.weapon)) break;
+            atkLuaCombo.push_back(luaw::RunWeaponFire(scriptDir.c_str(), shimPath.c_str(), ff.FileFor(it->second.weapon).c_str(),
+                                                      it->second.weapon.c_str(), 0, weaponItemPower, 0, 0, nullptr));
+        }
         if (!ff.weapon2.empty()) {
-            luaw::RunWeaponFire(scriptDir.c_str(), shimPath.c_str(), ff.FileFor(ff.weapon2).c_str(), ff.weapon2.c_str(), 0, 0, 0, 0, &weapon2Lua);
+            weapon2Attacks = luaw::RunWeaponFire(scriptDir.c_str(), shimPath.c_str(), ff.FileFor(ff.weapon2).c_str(), ff.weapon2.c_str(), 0, weaponItemPower, 0, 0, &weapon2Lua);
             DbgLog("[weapon-lua] weapon2 file='%s' fn='%s' loaded=%d moveBoxMultiplier=%.2f initArgs=%zu",
                    ff.file.c_str(), ff.weapon2.c_str(), (int)weapon2Lua.loaded,
                    weapon2Lua.moveBoxMultiplier, weapon2Lua.initArgs.size());
         }
         if (!ff.jump.empty()) {
-            luaw::RunWeaponFire(scriptDir.c_str(), shimPath.c_str(), ff.FileFor(ff.jump).c_str(), ff.jump.c_str(), 0, 0, 0, 0, &jumpAttackLua);
+            jumpAttacks = luaw::RunWeaponFire(scriptDir.c_str(), shimPath.c_str(), ff.FileFor(ff.jump).c_str(), ff.jump.c_str(), 0, weaponItemPower, 0, 0, &jumpAttackLua);
             DbgLog("[weapon-lua] jump file='%s' fn='%s' loaded=%d initArgs=%zu dropAfterMs=%.0f drop=(%.0f,%.0f,%.0f)",
                    ff.file.c_str(), ff.jump.c_str(), (int)jumpAttackLua.loaded, jumpAttackLua.initArgs.size(),
                    jumpAttackLua.dropTime, jumpAttackLua.dropX, jumpAttackLua.dropY, jumpAttackLua.dropZ);
@@ -2433,6 +2965,183 @@ void WorldState::HitPeersInCone(float range, float dmg, float knock) {
     }
 }
 
+// One CreateCAttack shape against a point, in the attacker's space: the
+// shape's center/dir are actor-local (y up, -z forward: MAKEVECTOR3(0,0,-1)),
+// placed by the actor's position and facing like the body (charYaw + pi).
+// The target is a body: its point is tested with a 40-unit radius.
+bool WorldState::AttackShapeHits(const luaw::AttackShape& sh, float px, float py, float pz) const {
+    const float a = charYaw + 3.14159265f, c = std::cos(a), s = std::sin(a);
+    const float wx = px - charPos[0], wy = py - charPos[1], wz = pz - charPos[2];
+    // world = local * R (BuildYawPitchTranslate rows) -> local = world * R^T
+    const float lx = wx * c - wz * s, ly = wy, lz = wx * s + wz * c;
+    const float R = 40.f;
+    const float vx = lx - sh.centerX, vy = ly - sh.centerY, vz = lz - sh.centerZ;
+    float ux = sh.dirX, uy = sh.dirY, uz = sh.dirZ;
+    const float ul = std::sqrt(ux*ux + uy*uy + uz*uz);
+    if (ul > 1e-6f) { ux /= ul; uy /= ul; uz /= ul; } else { ux = 0.f; uy = 0.f; uz = -1.f; }
+    const std::string& k = sh.kind;
+    if (k == "sphere") return std::sqrt(vx*vx + vy*vy + vz*vz) <= sh.radius + R;
+    if (k == "ray" || k == "thickray") {
+        const float t = (std::max)(0.f, (std::min)(sh.length, vx*ux + vy*uy + vz*uz));
+        const float dx = vx - ux*t, dy = vy - uy*t, dz = vz - uz*t;
+        return std::sqrt(dx*dx + dy*dy + dz*dz) <= R + (k == "thickray" ? sh.radius : 0.f);
+    }
+    if (k == "box" || k == "pole") {
+        // length along dir from the center, width across, height up.
+        const float along = vx*ux + vy*uy + vz*uz;
+        if (along < -R || along > sh.length + R) return false;
+        float rx = uz, rz = -ux; const float rl = std::sqrt(rx*rx + rz*rz);
+        if (rl > 1e-6f) { rx /= rl; rz /= rl; } else { rx = 1.f; rz = 0.f; }
+        if (std::fabs(vx*rx + vz*rz) > sh.width * 0.5f + R) return false;
+        return std::fabs(vy) <= sh.height * 0.5f + R;
+    }
+    if (k == "fan" || k == "cone") {
+        // A slice on the ground: within length (cone: radius) and +-angle/2 of dir.
+        const float reach = k == "cone" ? sh.radius : sh.length;
+        const float hd = std::sqrt(vx*vx + vz*vz);
+        if (hd > reach + R) return false;
+        if (k == "fan" && std::fabs(vy) > sh.height * 0.5f + R) return false;
+        if (hd <= R) return true;
+        const float hl = std::sqrt(ux*ux + uz*uz);
+        if (hl < 1e-6f) return true;
+        const float cosA = (vx*ux + vz*uz) / (hd * hl);
+        return cosA >= std::cos(sh.angle * 0.5f * 3.14159265f / 180.f);
+    }
+    if (k == "cylinder") {
+        const float hd = std::sqrt(vx*vx + vz*vz);
+        return hd <= sh.radius + R && vy >= -R && vy <= sh.length + R;
+    }
+    return false;
+}
+
+// Everything an actor-state function declares for its state, as the client
+// plays it on entering: AddSound / AddSoundBySex (the female voice for a female
+// character) at their start, every AddSequence (BySex: the female version) at
+// its start time, AddInstantEffect on its node of the worn item, the trail.
+void WorldState::PlayStateFx(const anim::ActorFunc* fn, unsigned tnow) {
+    if (!fn) { StartGhostTrail(nullptr); return; }
+    for (const anim::ActorSound& s : fn->sounds)
+        if (!s.man.empty()) audio::PlayEffect(female && !s.girl.empty() ? s.girl : s.man, 0.85f, (unsigned)(std::max)(0, s.start));
+    if (anim::ShapeChange())   // AddSoundTransBySex: the transformed sigma's sounds
+        for (const anim::ActorSound& s : fn->transSounds)
+            if (!s.man.empty()) audio::PlayEffect(female && !s.girl.empty() ? s.girl : s.man, 0.85f, (unsigned)(std::max)(0, s.start));
+    for (const anim::ActorSeq& q : fn->seqs)
+        pendingSeqs.push_back({ tnow + (unsigned)(std::max)(0, q.startMs), (female && !q.seqGirl.empty()) ? q.seqGirl : q.seq, q.sound, q.index });
+    for (const anim::ActorInstantEffect& e : fn->instant) {
+        PendingSeq ps{ tnow + (unsigned)(std::max)(0, e.startMs), e.seq, e.sound };
+        ps.node = e.node;
+        pendingSeqs.push_back(ps);
+    }
+    const anim::ActorGhostTrail* g = nullptr;
+    for (const anim::ActorGhostTrail& t : fn->ghosts) if (!t.name.empty()) { g = &t; break; }
+    StartGhostTrail(g);
+}
+
+// A hit's reaction takes the body: whatever the actor was doing is cut.
+void WorldState::StartReaction(int kind, unsigned tnow, unsigned durMs) {
+    reactKind = kind; reactPhase = 0; reactStart = reactPhaseStart = tnow;
+    reactEnd = tnow + durMs; reactLeftGround = false;
+    if (kind != REACT_FLINCH) {
+        atkParam = nullptr; weapon2Active = false; swingAttacks = nullptr;
+        ghostTrail = nullptr; ghostSamples.clear(); pendingSeqs.clear();
+        gunFiring = false;
+    }
+}
+
+void WorldState::StartSwingAttacks(const std::vector<luaw::WeaponAttack>* atks, unsigned tnow, float baseDmg) {
+    swingAttacks = (atks && !atks->empty()) ? atks : nullptr;
+    swingStart = tnow;
+    swingFired.assign(swingAttacks ? swingAttacks->size() : 0, 0);
+    swingBaseDmg = baseDmg;
+}
+
+// Fires every attack of the swing at its own fireTime. Attacks sharing a
+// fireTime are one hit per target: a critical one (SetAlwaysCritical) wins
+// where it lands - and only where the attack it DependOn lands too - else
+// the normal one. The target's reaction comes from the conditions of every
+// attack of that moment that reached it (AddStunCondition time by distance,
+// AddBlowCondition, AddPushCondition).
+void WorldState::ProcessSwingAttacks(unsigned tnow) {
+    if (!swingAttacks) return;
+    const std::vector<luaw::WeaponAttack>& atks = *swingAttacks;
+    const float since = float(tnow - swingStart);
+    for (size_t i = 0; i < atks.size(); ++i) {
+        if (swingFired[i] || since < atks[i].fireTime) continue;
+        std::vector<size_t> group;
+        for (size_t j = 0; j < atks.size(); ++j)
+            if (!swingFired[j] && atks[j].fireTime == atks[i].fireTime) { group.push_back(j); swingFired[j] = 1; }
+        // Targets: the other players on this map, and the clone (C key).
+        struct Target { int id; float x, y, z; };
+        std::vector<Target> targets;
+        if (mpOnline && mpClient.Connected() && mapIdx >= 0 && mapIdx < (int)maps.size())
+            for (auto& kv : mpClient.Peers()) {
+                const mp::Peer& pp = kv.second;
+                if (pp.hasPos && pp.map == maps[mapIdx].name) targets.push_back({ pp.id, pp.rx, pp.ry, pp.rz });
+            }
+        for (size_t ci = 0; ci < clones.size(); ++ci) targets.push_back({ -1 - (int)ci, clones[ci].pos[0], clones[ci].pos[1] + clones[ci].lift, clones[ci].pos[2] });
+        bool upperCutLanded = false; float upperDist = 0.f, upperPower = 0.f;
+        for (const Target& p : targets) {
+            auto shapeHits = [&](const luaw::WeaponAttack& a) {
+                for (float h : { 30.f, 100.f, 170.f }) if (AttackShapeHits(a.shape, p.x, p.y + h, p.z)) return true;
+                return false;
+            };
+            const luaw::WeaponAttack* crit = nullptr; const luaw::WeaponAttack* normal = nullptr;
+            float stunMs = 0.f, blowDist = 0.f, blowPower = 0.f, knock = 0.f, pushMs = 0.f;
+            bool shake = false; std::vector<float> shakeF1;
+            const float dx = p.x - charPos[0], dz = p.z - charPos[2];
+            const float dist = std::sqrt(dx*dx + dz*dz);
+            for (size_t j : group) {
+                const luaw::WeaponAttack& a = atks[j];
+                if (!shapeHits(a)) continue;
+                if (a.dependOn >= 0 && a.dependOn < (int)atks.size() && !shapeHits(atks[a.dependOn])) continue;
+                if (a.alwaysCritical) { if (!crit) crit = &a; } else if (!normal) normal = &a;
+                for (size_t q = 0; q + 3 < a.stun.size(); q += 4) {
+                    // (minMs, maxMs, minDist, maxDist): the closer, the longer.
+                    const float minT = a.stun[q], maxT = a.stun[q+1], minD = a.stun[q+2], maxD = a.stun[q+3];
+                    const float f = maxD > minD ? (std::max)(0.f, (std::min)(1.f, (dist - minD) / (maxD - minD))) : 0.f;
+                    stunMs = (std::max)(stunMs, maxT - (maxT - minT) * f);
+                }
+                // (dist, power) = launch speed away from the attacker (negative: towards
+                // it) and upwards (S10 CBlowCondition::Apply 0x00FD5890).
+                for (size_t q = 0; q + 1 < a.blow.size(); q += 2) if (a.blow[q+1] > blowPower || (blowPower == 0.f && a.blow[q] != 0.f)) { blowDist = a.blow[q]; blowPower = a.blow[q+1]; }
+                for (size_t q = 0; q + 1 < a.upperCut.size(); q += 2) { upperCutLanded = true; upperDist = a.upperCut[q]; upperPower = (std::max)(upperPower, a.upperCut[q+1]); }
+                for (size_t q = 0; q + 2 < a.push.size(); q += 3) if (a.push[q+1] > knock) { knock = a.push[q+1]; pushMs = a.push[q]; }
+                if (a.shakeEnable && a.shakeWhenSuccess && !shake) { shake = true; shakeF1 = a.shakeF1; }
+            }
+            if (!crit && !normal) continue;
+            // Damage: the landing attack's own power from its InitAttack1 (the
+            // script's formula on the item's power: plasma weak fan 4.5, its
+            // critical box 3.4, each dash hit 1.7, counter sword heavy 22.3).
+            const luaw::WeaponAttack* landed = crit ? crit : normal;
+            const float dmg = landed->power > 0.f ? landed->power : swingBaseDmg;
+            if (p.id < 0) CloneHit(clones[-1 - p.id], dmg, stunMs, blowDist, blowPower, tnow);
+            else mpClient.SendHit(p.id, dmg, knock, stunMs, blowDist, blowPower, crit != nullptr, pushMs);
+            if (shake) StartShake(shakeF1, tnow);
+            DbgLog("[mp] attack t=%.0f hit %d dist=%.0f crit=%d stun=%.0f blow=%.0f/%.0f push=%.0f shape=%s",
+                   atks[i].fireTime, p.id, dist, (int)(crit != nullptr), stunMs, blowDist, blowPower, knock, (crit ? crit : normal)->shape.kind.c_str());
+        }
+        // AddUpperCutCondition (S10 CUpperCutCondition::Apply 0x00FDD1F0): a
+        // landed hit sends the attacker into STATE_UPPERCUT with speed
+        // (facing * dist, power) - the Death Scythe goes up with its target.
+        if (upperCutLanded && upperPower > 0.f) {
+            StartReaction(REACT_UPPERCUT, tnow, 0);
+            reactVX = std::sin(charYaw) * upperDist; reactVZ = std::cos(charYaw) * upperDist;
+            velY = upperPower; grounded = false;
+            DbgLog("[weapon] uppercut: attacker rises at %.0f (forward %.0f)", upperPower, upperDist);
+            return;   // the attack state is over (StartReaction dropped its attacks)
+        }
+    }
+}
+
+// SetCameraShakeSetFactor1(a, b, c): the third is the size of the shake
+// (plasma strong 20, dash 50); it decays over 300 ms. (Exact S10 shake curve
+// not reversed yet - amplitude from the script, length assumed.)
+void WorldState::StartShake(const std::vector<float>& f1, unsigned tnow) {
+    const float amp = f1.size() >= 3 ? f1[2] : (f1.empty() ? 20.f : f1.back());
+    (void)tnow;   // the render clock: the shake is drawn by OnRender
+    shakeStart = GetTickCount(); shakeEnd = shakeStart + 300; shakeAmp = (std::max)(0.f, amp);
+}
+
 bool WorldState::PeerAlongRay(const float org[3], const float dir[3], float maxT, int& peerId, float& tHit) {
     if (!mpOnline || !mpClient.Connected() || mapIdx < 0 || mapIdx >= (int)maps.size()) return false;
     bool found = false; tHit = maxT;
@@ -2458,7 +3167,7 @@ bool WorldState::PeerAlongRay(const float org[3], const float dir[3], float maxT
 void WorldState::FireGunShot(unsigned tnow) {
     if (!weaponAnim.gunBlastSound.empty()) audio::PlayEffect(weaponAnim.gunBlastSound, 0.8f);
     const float viewYaw = camYaw + lookYaw;
-    const float viewPitch = (std::max)(-0.35f, (std::min)(1.2f, camPitch + lookPitch));
+    const float viewPitch = (std::max)(kPitchUp, (std::min)(kPitchDown, camPitch + lookPitch));
     const float right[3] = { std::cos(viewYaw), 0.f, -std::sin(viewYaw) };
     const float fh[3] = { std::sin(viewYaw), 0.f, std::cos(viewYaw) };
     float mz[3] = { gunMuzzle[0], gunMuzzle[1], gunMuzzle[2] };
@@ -2482,7 +3191,8 @@ void WorldState::FireGunShot(unsigned tnow) {
     float fwd[3] = { std::sin(viewYaw) * cp, -std::sin(viewPitch), std::cos(viewYaw) * cp };
     const float heightOff = kCamHeightOffset, sideOff = kCamSideOffset * camSideCur;   // same framing as OnRender
     const float at[3] = { charPos[0] + right[0]*sideOff, charPos[1] + heightOff, charPos[2] + right[2]*sideOff };
-    const float eye[3] = { at[0] - fwd[0]*camDist, at[1] - fwd[1]*camDist, at[2] - fwd[2]*camDist };
+    const float eyeDist = camDistEff > 0.f ? (std::min)(camDistEff, camDist) : camDist;
+    const float eye[3] = { at[0] - fwd[0]*eyeDist, at[1] - fwd[1]*eyeDist, at[2] - fwd[2]*eyeDist };
     // What the crosshair points at (camera ray), then the client's shot: it
     // leaves the actor at InitLua's height/side/front offsets and flies to
     // that point, up to RayDistanceLimit (25000, FUN_012bfd40).
@@ -2502,10 +3212,10 @@ void WorldState::FireGunShot(unsigned tnow) {
     }
     float t = 0.f;
     float target[3];
-    if (RayCollTris(collTris, eye, fwd, camDist + kRayLimit, t) && t >= camDist * 0.5f)
+    if (RayCollTris(collTris, eye, fwd, eyeDist + kRayLimit, t) && t >= eyeDist * 0.5f)
         for (int k = 0; k < 3; ++k) target[k] = eye[k] + fwd[k] * t;
     else
-        for (int k = 0; k < 3; ++k) target[k] = eye[k] + fwd[k] * (camDist + kRayLimit);
+        for (int k = 0; k < 3; ++k) target[k] = eye[k] + fwd[k] * (eyeDist + kRayLimit);
     float org[3] = { mz[0], mz[1], mz[2] };
     DbgLog("[gun] shot %u from %s (%.0f,%.0f,%.0f) actor (%.0f,%.0f,%.0f) node='%s'", gunShotIndex,
            gunMuzzleValid ? "fire node" : "InitLua offsets", org[0], org[1], org[2], charPos[0], charPos[1], charPos[2], weaponAnim.gunFireBone.c_str());
@@ -2519,7 +3229,11 @@ void WorldState::FireGunShot(unsigned tnow) {
     float ar[3] = { dir[2], 0.f, -dir[0] };
     { const float l = std::sqrt(ar[0]*ar[0] + ar[2]*ar[2]); if (l > 1e-5f) { ar[0] /= l; ar[2] /= l; } else { ar[0] = 1.f; ar[2] = 0.f; } }
     const float au[3] = { dir[1]*ar[2] - dir[2]*ar[1], dir[2]*ar[0] - dir[0]*ar[2], dir[0]*ar[1] - dir[1]*ar[0] };
-    std::vector<GunRay> rays = gunRays;
+    // One group of rays per shot: all of them when they share a fireTime,
+    // else the group this shot lands on in the sequence.
+    std::vector<GunRay> rays;
+    for (const GunRay& g : gunRays)
+        if (gunRayGroups <= 1 || g.group == (gunForceGroup >= 0 ? gunForceGroup : (int)(gunShotIndex % (unsigned)gunRayGroups))) rays.push_back(g);
     if (rays.empty()) rays.push_back(GunRay{});
     bool anyWall = false;
     mp::Shot netShot;   // what the other players draw of this shot
@@ -2547,11 +3261,14 @@ void WorldState::FireGunShot(unsigned tnow) {
         if (onPeer) t = peerT;
         const float hit[3] = { org[0] + d[0]*t, org[1] + d[1]*t, org[2] + d[2]*t };
         if (!gunBeamNodes.empty()) gunBeams.push_back({ { hit[0], hit[1], hit[2] }, (unsigned)GetTickCount() });   // OnRender's clock
+        // No tracer .seq on the attribute (revolver, handgun, shotguns...):
+        // separated bullets flying from the muzzle (see OnRender).
         else gunTracers.push_back({ { mz[0], mz[1], mz[2] }, { hit[0], hit[1], hit[2] }, (unsigned)GetTickCount() });
         netShot.ends.push_back({ hit[0], hit[1], hit[2], onPeer ? 2 : (onMap ? 1 : 0) });
         if (onPeer) {
             const float dmg = 10.f / (float)rays.size() * (rays.size() > 1 ? 2.f : 1.f);
-            mpClient.SendHit(peerId, dmg, 0.f);
+            // AddPushCondition (ms, speed, accel) of the ray: the target is pushed.
+            mpClient.SendHit(peerId, dmg, gr.pushSpeed, 0.f, 0.f, 0.f, false, gr.pushMs);
             DbgLog("[mp] bullet hit -> %d dmg=%.1f at %.0f", peerId, dmg, t);
             if (!weaponAnim.gunHitSeq.empty()) spawnFixed(weaponAnim.gunHitSeq, hit[0], hit[1], hit[2], viewYaw);
             if (!weaponAnim.gunHitSound.empty()) audio::PlayEffect(weaponAnim.gunHitSound, 0.7f);
@@ -2590,7 +3307,7 @@ const std::pair<std::vector<WorldState::BeamNode>, uint32_t>& WorldState::BeamNo
     if (!seqPath.empty()) {
         std::string p = seqPath; std::replace(p.begin(), p.end(), '\\', '/');
         std::string low = p; for (char& c : low) c = (char)std::tolower((unsigned char)c);
-        p = (low.rfind("resources/", 0) == 0 ? "resources/" : "resources/resources/") + p;
+        p = (low.rfind("resources/", 0) == 0 ? RES("resources/") : RES("resources/resources/")) + p;
         const seq::Sequence ts = seq::Parse(p.c_str());
         for (const seq::Node& n : ts.nodes) if (n.isLightning) v.first.push_back({ n.beam, n.beginTime, n.endTime });
         v.second = ts.duration;
@@ -2632,7 +3349,7 @@ void WorldState::BuildWeaponList() {
     weaponList.clear();
     std::vector<std::string> models;
     WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA("resources/resources/model/weapon/*.scn", &fd);
+    HANDLE h = FindFirstFileA(RESC("resources/resources/model/weapon/*.scn"), &fd);
     if (h != INVALID_HANDLE_VALUE) { do { models.push_back(fd.cFileName); } while (FindNextFileA(h, &fd)); FindClose(h); }
     if (models.empty()) return;
 
@@ -2732,7 +3449,7 @@ void WorldState::EquipEntry(int index) {
 
 // Skeleton (<sex>_bip.scn: bones + every clip) plus the default 00_<sex>_*
 // body meshes skinned to it. F7 swaps between them at runtime.
-static const char* kCharBase = "resources/resources/model/character/";
+#define kCharBase RESC("resources/resources/model/character/")
 
 // .scn for one costume slot: the wardrobe choice or the default 00_<sex>_<slot>.
 static std::string CostumeFile(bool asFemale, int slot) {
@@ -2808,6 +3525,9 @@ static scn::Scene LoadCharacterSkeleton(bool asFemale) {
                 if (std::find(skel.animNames.begin(), skel.animNames.end(), n) == skel.animNames.end())
                     skel.animNames.push_back(n);
         }
+        // The merged clips are copies of the extension's tracks: counted on the skeleton.
+        if (ext.ok && added) skel.memTag.Set(reslog::SCN, skel.memTag.path + " + " + sex + "_bip_0000 clips",
+                                             skel.memTag.bytes + ext.memTag.bytes, "(merged skeleton)");
         DbgLog("[char] %s_bip_0000 ext=%d merged %zu bone tracks, clips now %zu",
                sex.c_str(), (int)ext.ok, added, skel.animNames.size());
     }
@@ -2941,7 +3661,7 @@ static std::string NormName(const std::string& s) {
 void WorldState::BuildCostumeList() {
     if (costumeBuilt) return;
     costumeBuilt = true;
-    const std::string x = ReadTextFile("resources/xml/item.x7");
+    const std::string x = ReadTextFile(RESC("resources/xml/item.x7"));
     auto attr = [](const std::string& tag, const std::string& name) -> std::string {
         const std::string pat = " " + name + "=\"";
         size_t p = tag.find(pat); if (p == std::string::npos) return "";
@@ -3047,7 +3767,7 @@ void WorldState::BuildCostumeList() {
     //         model of its weapon type (weaponList).
     {
         std::map<long, std::string> statesOf, sceneOf, weakAniOf;
-        const std::string lua = ReadTextFile("resources/xml/weapon_lua.x7");
+        const std::string lua = ReadTextFile(RESC("resources/xml/weapon_lua.x7"));
         for (size_t p = 0; (p = lua.find("<lua_func item_key=\"", p)) != std::string::npos; ) {
             p += 20;
             const long k = strtol(lua.c_str() + p, nullptr, 10);
@@ -3063,7 +3783,7 @@ void WorldState::BuildCostumeList() {
             }
             p = e;
         }
-        const std::string ew = ReadTextFile("resources/xml/_eu_weapon.x7");
+        const std::string ew = ReadTextFile(RESC("resources/xml/_eu_weapon.x7"));
         for (size_t p = 0; (p = ew.find("<weapon item_key=\"", p)) != std::string::npos; ) {
             p += 18;
             const long k = strtol(ew.c_str() + p, nullptr, 10);
@@ -3073,7 +3793,7 @@ void WorldState::BuildCostumeList() {
             p = e;
         }
         std::vector<std::string> models;
-        { WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA("resources/resources/model/weapon/*.scn", &fd);
+        { WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(RESC("resources/resources/model/weapon/*.scn"), &fd);
           if (h != INVALID_HANDLE_VALUE) { do { std::string f = fd.cFileName; for (char& c : f) c = (char)std::tolower((unsigned char)c); models.push_back(f); } while (FindNextFileA(h, &fd)); FindClose(h); } }
         const std::set<std::string> modelSet(models.begin(), models.end());
         auto tokens = [](std::string s) {
@@ -3290,7 +4010,9 @@ bool WorldState::MouseClient(int& mx, int& my) const {
 void WorldState::OnEnter() {
     weaponBoneOverrides = LoadWeaponBoneOverrides();
     female = gCostume.female;
+    crash::LogMemory("before character");
     LoadCharacterBody(female);
+    crash::LogMemory("after character (skeleton + clips + outfit)");
 
     // Estados de animacion desde los .lua del cliente. Lo que el lua no cubra
     // sigue saliendo de las tablas de anim_states.h.
@@ -3300,13 +4022,18 @@ void WorldState::OnEnter() {
         DbgLog("[anim] lua: %zu funciones, %d estados cubiertos, %zu armas con NormalState_",
                luaStates.size(), n, luaStates.Weapons("NormalState_").size());
     }
+    crash::LogMemory("after actorstates lua");
     BuildWeaponList();
     SpawnCostumeEffects();
     EquipWeapon(0);
+    crash::LogMemory("after weapon");
     ScanMaps();
     int start = 0;
+    // Default map: Station 2 (the square if this resource set lacks it).
     for (size_t i = 0; i < maps.size(); ++i) if (maps[i].ini == "bginfo-square.ini") { start = (int)i; break; }
+    for (size_t i = 0; i < maps.size(); ++i) if (maps[i].ini == "bginfo-station-2.ini") { start = (int)i; break; }
     LoadMap(start);
+    crash::LogMemory("after map");
     menuSel = mapIdx;
     // The menu opens with the game: online or solo first (ESC brings it back).
     mapMenu = true; menuPage = 0; mainSel = gOnline.enabled ? 0 : 1;
@@ -3324,13 +4051,17 @@ void WorldState::OnEnter() {
 
 void WorldState::OnUpdate() {
     if (!displayApplied) { displayApplied = true; if (gResW > 0 || gBorderless) ApplyDisplayMode(); }
-    if (GetAsyncKeyState(VK_F5) & 1) audio::ToggleMusic();
+    if (GetAsyncKeyState(VK_F5) & 1) {   // music on / off (saved)
+        gMusicOn = !gMusicOn;
+        if (gMusicOn) PlayMapMusic(0); else audio::StopMusic();
+        SaveWeaponSlots();
+    }
     if (GetAsyncKeyState(VK_F6) & 1) {
         const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        PlayMapMusic(shift ? bgmIndex - 1 : bgmIndex + 1);   // Shift+F6 = previous track
+        ChangeMusic(shift ? -1 : +1);   // Shift+F6 = previous track
     }
     if (GetAsyncKeyState(VK_F7) & 1) LoadCharacterBody(!female);   // male <-> female bip
-    if (audio::ConsumeMusicFinished()) PlayMapMusic(bgmIndex + 1);
+    if (audio::ConsumeMusicFinished() && gMusicOn) PlayMapMusic(gMusicTrack.empty() ? bgmIndex + 1 : 0);   // the chosen track repeats
     // ESC menu (also open when the game starts). While it is open the world is
     // frozen and the cursor comes back; the online link keeps running.
     // Main: online / solo / maps / wardrobe / weapons / sex / back / quit.
@@ -3378,7 +4109,7 @@ void WorldState::OnUpdate() {
             }
         } else if (menuPage == 3) {
             // Settings: Up/Down row, Left/Right (or Enter / click) changes it.
-            const int rows = 5;
+            const int rows = 7;
             if (GetAsyncKeyState(VK_UP)   & 1) settingsSel = (settingsSel + rows - 1) % rows;
             if (GetAsyncKeyState(VK_DOWN) & 1) settingsSel = (settingsSel + 1) % rows;
             int step = 0;
@@ -3420,6 +4151,11 @@ void WorldState::OnUpdate() {
                     ApplyDisplayMode();
                 } else if (settingsSel == 3) {
                     gGraphicsQuality = (gGraphicsQuality + (step > 0 ? 1 : 2)) % 3;
+                } else if (settingsSel == 4) {
+                    gMusicOn = !gMusicOn;
+                    if (gMusicOn) PlayMapMusic(0); else audio::StopMusic();
+                } else if (settingsSel == 5) {
+                    ChangeMusic(step > 0 ? +1 : -1);
                 } else {
                     menuPage = 0;
                 }
@@ -3542,6 +4278,35 @@ void WorldState::OnUpdate() {
         if (slotKey != -2 && !busy) EquipWeapon(slotKey);
     }
 
+    // C: leave a clone here, frozen in the pose we have right now (moves it if
+    // there is one); V releases it.
+    if (GetAsyncKeyState(VK_OEM_6) & 1) { ++gHolsterRoll45; ++gHolsterGen; DbgLog("[weapon] holster roll step %d (%d deg)", gHolsterRoll45 & 7, (gHolsterRoll45 & 7) * 45); }
+    if (GetAsyncKeyState(VK_OEM_4) & 1) { --gHolsterRoll45; ++gHolsterGen; DbgLog("[weapon] holster roll step %d (%d deg)", gHolsterRoll45 & 7, (gHolsterRoll45 & 7) * 45); }
+    if (GetAsyncKeyState('V') & 1) { if (!clones.empty()) DbgLog("[clone] released %zu", clones.size()); ReleaseClones(); }
+    if (GetAsyncKeyState('C') & 1) {
+        Clone c;
+        std::memcpy(c.pos, charPos, sizeof(c.pos));
+        c.yaw = charYaw;
+        c.pose = curPose;
+        c.lowerActive = curLowerPoseActive; c.lowerPose = curLowerPose;
+        c.born = GetTickCount();
+        c.ghostSamples = ghostSamples; c.ghostTrail = ghostTrail; c.ghostStart = ghostStart; c.ghostAt = c.born;
+        // The effects playing now stay with it, frozen where and when they were.
+        const size_t n = activeEffects.size();
+        for (size_t i = 0; i < n; ++i) {
+            const ActiveEffect& e = activeEffects[i];
+            if (e.frozen || e.history.empty()) continue;
+            ActiveEffect f = e;
+            f.frozen = true; f.frozenAge = e.lastAge; f.fixedWorld = e.history.back().second;
+            f.history.clear(); f.followActor = false; f.attachNode.clear(); f.attachFallback.clear();
+            f.tag = "clone"; f.offX = f.offZ = 0.f;
+            activeEffects.push_back(std::move(f));
+        }
+        clones.push_back(std::move(c));
+        DbgLog("[clone] #%zu at (%.0f %.0f %.0f) pose '%s' tick %u, %zu effects kept", clones.size(), charPos[0], charPos[1], charPos[2],
+               curPose.clipA.c_str(), curPose.tickA, activeEffects.size() - n);
+    }
+
     if (GetAsyncKeyState(VK_F1) & 1) {
         boneEditMode = !boneEditMode;
         boneEditPopupUntil = GetTickCount() + 2500;
@@ -3639,7 +4404,7 @@ void WorldState::OnUpdate() {
     const float zoomStep = std::exp(lastDt * 0.7f);
     if (GetAsyncKeyState(VK_UP)    & 0x8000) camDist /= zoomStep;
     if (GetAsyncKeyState(VK_DOWN)  & 0x8000) camDist *= zoomStep;
-    if (camPitch < -0.35f) camPitch = -0.35f;  if (camPitch > 1.2f) camPitch = 1.2f;
+    if (camPitch < kPitchUp) camPitch = kPitchUp;  if (camPitch > kPitchDown) camPitch = kPitchDown;
     // Z: swap the camera to the other shoulder (ActorCameraSideOffset).
     if (GetAsyncKeyState('Z') & 1) camSideTarget = -camSideTarget;
     if (GetAsyncKeyState(VK_PRIOR) & 0x8000) camDist *= 0.95f;
@@ -3716,7 +4481,9 @@ void WorldState::OnUpdate() {
     // In the air an attack stops the travel: no WASD drift (the swing's own
     // MoveBox / SetDrop still move it, e.g. the CS dive).
     if (inAttack && !grounded) attackMoveRate = 0.f;
-    const bool attackLocked = inAttack && attackMoveRate <= 0.f;
+    // Taking a hit (stun / knocked down / flinch / dead): no control at all.
+    const bool reacting = reactKind != REACT_NONE;
+    const bool attackLocked = (inAttack && attackMoveRate <= 0.f) || reacting;
 
     // --- Game::CUserInput -> Common::CStateMachine::Input (src/game) ---
     // Keys become input IDs through the beta's own InputUnit list (W double
@@ -3833,6 +4600,7 @@ void WorldState::OnUpdate() {
             ((fsm.current() == anim::STATE_JUMP && jumpHadDir) ||
              (fsm.current() == anim::STATE_BOUNDJUMP && wallJumpTimeLeft > 0.f)))
             fsmTryWallJump = true;
+        if (reacting) continue;   // the reaction owns the actor
         if (id != game::IN_MOVE && id != game::IN_STOP)
             DbgLog("[input] t=%u id=%d state=%d grounded=%d", nowMs, id, (int)fsm.current(), (int)grounded);
         fsm.Input(id, fctx);
@@ -4098,13 +4866,15 @@ void WorldState::OnUpdate() {
             // up +, clamped to +-90 by sub_723A60) picks the half - Upper
             // (A straight up, B level) when > 0, Lower (A straight down, B
             // level) otherwise - and blends toward B by 1 - angle / limit.
-            const float viewPitch = (std::max)(-0.35f, (std::min)(1.2f, camPitch + lookPitch));
+            const float viewPitch = (std::max)(kPitchUp, (std::min)(kPitchDown, camPitch + lookPitch));
             const float angle = (std::max)(-90.f, (std::min)(90.f, -viewPitch * 57.2958f));
             const anim::BlendSlot* slot = anim::WeaponFireBlendSlot(luaStates.parsed(), weaponStates);
             const anim::ActorBlend* e = nullptr;
             if (slot) {
                 const auto& half = (angle > 0.f || slot->lower.empty()) ? slot->upper : slot->lower;
-                const std::string dir = ac.moving ? anim::RunDir(ac.inX, ac.inZ) : std::string("NORMAL");
+                // In the air the blender's Jump (rising) / Fly (falling) rows, as the Lua defines them.
+                const std::string dir = !grounded ? std::string(velY > 0.f ? "JUMP" : "FLY")
+                                      : ac.moving ? anim::RunDir(ac.inX, ac.inZ) : std::string("NORMAL");
                 auto it = half.find(dir);
                 if (it == half.end()) it = half.find("NORMAL");
                 if (it != half.end()) e = &it->second; else if (!half.empty()) e = &half.begin()->second;
@@ -4154,7 +4924,9 @@ void WorldState::OnUpdate() {
         }
         // Legs while firing: the fire state's lowerPartStateSet (E0008.. by
         // direction while walking, AS002 standing) instead of the plain walk.
-        if (gunFirePoseActive && !gunReloading) {
+        // lowerPartStateSet only has walking rows: in the air the legs keep the
+        // jump / fall clip (the blender's Jump/Fly rows drive the torso).
+        if (gunFirePoseActive && !gunReloading && grounded) {
             const auto lower = anim::WeaponFireLower(luaStates.parsed(), weaponStates);
             auto it = lower.find(ac.moving ? anim::RunDir(ac.inX, ac.inZ) : std::string("NORMAL"));
             if (it == lower.end()) it = lower.find("NORMAL");
@@ -4182,14 +4954,40 @@ void WorldState::OnUpdate() {
             up.fromBlend = curPose.blend; up.fromWeight = 1.f - inMs / gunPoseFadeMs;
         }
         curPose = up;
+        // In the air the fire state has no leg rows of its own: the legs keep a
+        // jump pose - the STANDING jump's rise (JUMP slot 1) / fall (slot 5).
+        // The moving jump (slot 2) is a forward somersault and must not play
+        // while shooting.
+        if (gunFirePoseActive && !gunReloading && !grounded) {
+            const std::vector<anim::SAnimParam>* rows = animCtrl.StateRows(anim::STATE_JUMP);
+            const size_t slot = velY > 0.f ? 1u : 5u;
+            if (rows && slot < rows->size() && CharacterHasClip(character, (*rows)[slot].clip)) {
+                const anim::SAnimParam& jp = (*rows)[slot];
+                curLowerPose.clipA = jp.clip; curLowerPose.clipB.clear(); curLowerPose.blend = 0.f;
+                curLowerPose.loopA = jp.loop;
+                curLowerPose.tickA = (uint32_t)((float)(tnow - gunFireStart) * 4.8f * jp.rate);
+                curLowerPoseActive = true;
+            }
+        }
     }
 
     // Weapon swings run independently of the locomotion/jump/fall/dodge state
     // above and just overwrite curPose when one is active - you can throw a hit
     // mid-air just as well as on the ground.
     auto startAtk = [&](const anim::ActorAnim* param, bool strong) {
-        if (!param || tnow < atkCooldownUntil || atkParam || weapon2Active) return;
+        if (!param || tnow < atkCooldownUntil || atkParam || weapon2Active || reactKind != REACT_NONE) return;
         atkParam = param; atkStrongMode = strong; atkHitDone = false; atkStart = tnow;
+        // This swing's CreateCAttack list (weapon_*.lua): hits by shape and time.
+        {
+            const std::vector<luaw::WeaponAttack>* list = param == weaponAnim.atkStrong1 ? &atkLuaStrong1
+                : (strong || param == weaponAnim.atkCounter) ? &atkLuaStrong : &atkLuaWeak;
+            // Combo hit N (N >= 2) of a weapon whose rows give it its own function.
+            if (!strong && !weaponAnim.atkWeak.empty() && param > &weaponAnim.atkWeak.front() && param <= &weaponAnim.atkWeak.back()) {
+                const size_t hit = (size_t)(param - &weaponAnim.atkWeak.front());
+                if (hit - 1 < atkLuaCombo.size() && !atkLuaCombo[hit - 1].empty()) list = &atkLuaCombo[hit - 1];
+            }
+            StartSwingAttacks(list, tnow, strong ? 15.f : 8.f);
+        }
         atkBlendFrom = curPose;   // whatever was playing this frame - blended into the swing below
         float rawClipDur = durOfClip(param->clip);
         float dur = float(param->startMs) + rawClipDur;
@@ -4204,20 +5002,42 @@ void WorldState::OnUpdate() {
                (int)strong, param->clip.c_str(), param->startMs, rawClipDur, dur, speedScale, dur / speedScale);
 
         const bool jumpWeak = param == weaponAnim.jumpAtkWeak;
-        const anim::ActorSeq* fx = jumpWeak ? weaponAnim.seqJumpAtkWeak : (strong ? weaponAnim.seqStrong : weaponAnim.seqWeak);
-        const anim::ActorSound* snd = jumpWeak ? weaponAnim.sndJumpAtkWeak : (strong ? weaponAnim.sndStrong : weaponAnim.sndWeak);
-        if (snd) audio::PlayEffect(snd->man, 0.85f, (unsigned)(std::max)(0, snd->start));
-        if (fx && !fx->sound.empty()) audio::PlayEffect(fx->sound, 0.85f, (unsigned)(std::max)(0, fx->startMs));
+        // The state function behind this swing: everything it declares plays.
+        const anim::ActorFunc* stateFn = jumpWeak ? weaponAnim.fnJumpWeak
+            : param == weaponAnim.atkStrong1 ? weaponAnim.fnStrong1
+            : param == weaponAnim.atkCounter ? weaponAnim.fnCounter
+            : strong ? weaponAnim.fnStrong : nullptr;
+        if (!stateFn && !weaponAnim.atkWeak.empty() && param >= &weaponAnim.atkWeak.front() && param <= &weaponAnim.atkWeak.back()) {
+            const size_t hit = (size_t)(param - &weaponAnim.atkWeak.front());
+            if (hit < weaponAnim.fnWeakHits.size()) stateFn = weaponAnim.fnWeakHits[hit];
+        }
+        const anim::ActorSeq* fx = stateFn ? nullptr : jumpWeak ? weaponAnim.seqJumpAtkWeak : (strong ? weaponAnim.seqStrong : weaponAnim.seqWeak);
+        const anim::ActorSound* snd = stateFn ? nullptr : jumpWeak ? weaponAnim.sndJumpAtkWeak : (strong ? weaponAnim.sndStrong : weaponAnim.sndWeak);
+        if (snd) audio::PlayEffect(female ? snd->girl : snd->man, 0.85f, (unsigned)(std::max)(0, snd->start));
         if (weaponAnim.isGun && !weaponAnim.gunBlastSound.empty()) audio::PlayEffect(weaponAnim.gunBlastSound, 0.9f);
         {
             const auto& seqs = (param == weaponAnim.atkStrong1) ? atkSeqStrong1 : (strong ? atkSeqStrong : atkSeqWeak);
             for (const auto& sq : seqs)
                 pendingSeqs.push_back({ tnow + (unsigned)(std::max)(0.f, sq.startMs), sq.file, sq.sound });
         }
-        if (fx) {
-            float fx_ = std::sin(charYaw), fz_ = std::cos(charYaw);
-            SpawnSeq(fx->seq, charPos[0], charPos[1], charPos[2], charYaw + 3.14159265f);   // .seq is authored from the actor root (feet)
+        // The state's own AddSequence: .seq + sound `start` ms in (as weapon 2 below).
+        if (fx) pendingSeqs.push_back({ tnow + (unsigned)(std::max)(0, fx->startMs), (female && !fx->seqGirl.empty()) ? fx->seqGirl : fx->seq, fx->sound });   // AddSequenceBySex: the female version
+        if (stateFn) PlayStateFx(stateFn, tnow);
+        // <other_effects other_type="counter_sword" attack_seq/attack_ogg>: the
+        // counter sword's slash on its held swing and its counter attack, when the
+        // first attack lands - only on a counter sword (item <ability type> 1):
+        // Iron Boots items (type 43) carry the same block copied over.
+        const bool isCounterSword = weaponTypeId && *weaponTypeId == 1;
+        if (isCounterSword && (strong || (param == weaponAnim.atkCounter && weaponAnim.atkCounter)) && !weaponAttackSeq.empty()) {
+            float at = 0.f;
+            if (swingAttacks && !swingAttacks->empty()) at = swingAttacks->front().fireTime;
+            pendingSeqs.push_back({ tnow + (unsigned)at, "Resources/Effects/" + weaponAttackSeq,
+                                    weaponAttackOgg.empty() ? std::string() : "Resources/Sound/" + weaponAttackOgg });
         }
+        else StartGhostTrail(jumpWeak ? weaponAnim.ghostJumpAtkWeak
+                        : param == weaponAnim.atkStrong1 ? weaponAnim.ghostStrong1
+                        : param == weaponAnim.atkCounter ? weaponAnim.ghostCounter
+                        : strong ? weaponAnim.ghostStrong : weaponAnim.ghostWeak);
     };
 
     // Checked BEFORE the FSM is told: a refused start used to leave the FSM in
@@ -4225,7 +5045,7 @@ void WorldState::OnUpdate() {
     // the air after one frame.
     auto canStartWeapon2 = [&](bool aerial) {
         const auto& phases = aerial ? weaponAnim.jumpAtk : weaponAnim.atkWeapon2;
-        const bool ok = weaponOk && !phases.empty() && !atkParam && !weapon2Active && tnow >= atkCooldownUntil;
+        const bool ok = weaponOk && !phases.empty() && !atkParam && !weapon2Active && tnow >= atkCooldownUntil && reactKind == REACT_NONE;
         if (!ok) DbgLog("[weapon-action] refused aerial=%d weaponOk=%d phases=%zu atk=%d w2=%d cooldown=%dms", (int)aerial, (int)weaponOk,
                         phases.size(), (int)(atkParam != nullptr), (int)weapon2Active, (int)(atkCooldownUntil > tnow ? atkCooldownUntil - tnow : 0));
         return ok;
@@ -4238,15 +5058,29 @@ void WorldState::OnUpdate() {
         weapon2MoveBoxValid = false; weapon2MoveBoxClip.clear();
         atkBlendFrom = curPose;
         weapon2Phase = 0; weapon2PhaseStart = tnow; rightHeldAt = tnow; weapon2PeerHitDone = false;
-        const auto* fx = aerial ? weaponAnim.seqJumpAtk : weaponAnim.seqWeapon2;
-        const auto* snd = aerial ? weaponAnim.sndJumpAtk : weaponAnim.sndWeapon2;
+        StartSwingAttacks(aerial ? &jumpAttacks : &weapon2Attacks, tnow, 15.f);
+        // STATE:EnableCameraShake(true, whenSuccess, ms): the state's own shake
+        // at that time (plasma jump attack: 600 ms, on landing).
+        {
+            const luaw::WeaponFireState& w = aerial ? jumpAttackLua : weapon2Lua;
+            if (w.cameraShake.size() >= 3 && w.cameraShake[0] != 0.f && w.cameraShake[1] == 0.f) {
+                shakePendingAt = GetTickCount() + (unsigned)w.cameraShake[2];
+                shakePendingAmp = w.cameraShakeF1.size() >= 3 ? w.cameraShakeF1[2] : 30.f;
+            }
+        }
         for (const auto& sq : (aerial ? jumpAttackLua.sequences : weapon2Lua.sequences))
             pendingSeqs.push_back({ tnow + (unsigned)(std::max)(0.f, sq.startMs), sq.file, sq.sound });
-        if (snd) audio::PlayEffect(snd->man, 0.85f, (unsigned)(std::max)(0, snd->start));
-        if (fx && !fx->sound.empty()) audio::PlayEffect(fx->sound, 0.85f, (unsigned)(std::max)(0, fx->startMs));
-        if (fx) {
-            float fx_ = std::sin(charYaw), fz_ = std::cos(charYaw);
-            SpawnSeq(fx->seq, charPos[0], charPos[1], charPos[2], charYaw + 3.14159265f);   // .seq is authored from the actor root (feet)
+        // The state function's own declarations (sounds, effects, effects on
+        // nodes, trail). AddSequence(index, seq, sound, start[, range]): the .seq
+        // and its sound start `start` ms in, where the actor is then (plasma dash
+        // 500 ms in; counter sword jump attack lands at 400, its effect at 500).
+        PlayStateFx(aerial ? weaponAnim.fnJump : weaponAnim.fnWeapon2, tnow);
+        // Shape change (sigma blade right click): its own effect now; the weapon
+        // switches form once the action is over.
+        if (!aerial && weaponAnim.weaponChange) {
+            weaponChangePending = true;
+            const std::string& fxFile = anim::ShapeChange() ? weaponChangeOffSeq : weaponChangeOnSeq;
+            if (!fxFile.empty()) SpawnSeq("Resources/Effects/" + fxFile, charPos[0], charPos[1], charPos[2], charYaw + 3.14159265f);
         }
         DbgLog("[weapon-action] enter aerial=%d phase=0 clip='%s' rate=%.2f loop=%d",
                (int)aerial, phases[0].clip.c_str(), phases[0].rate, (int)phases[0].loop);
@@ -4316,18 +5150,42 @@ void WorldState::OnUpdate() {
             gunReloadEnd = tnow + gunReloadMs;
             if (!gunReloadSound.empty()) audio::PlayEffect("Resources/Sound/" + gunReloadSound, 0.9f);
         }
-        const bool canShoot = gs != anim::STATE_FASTRUN && gs != anim::STATE_DODGE_LEFT && gs != anim::STATE_DODGE_RIGHT;
+        const bool canShoot = gs != anim::STATE_FASTRUN && gs != anim::STATE_DODGE_LEFT && gs != anim::STATE_DODGE_RIGHT &&
+                              reactKind == REACT_NONE;
         const bool firing = lmbDown && !gunReloading && gunAmmo > 0 && canShoot;
         if (firing && !gunFiring) { gunFireStart = tnow; gunLastShotAt = 0; gunPrevShotAt = 0; }
         gunFiring = firing;
-        if (gunFiring && tnow >= gunNextShotAt) {
-            FireGunShot(tnow);
+        auto fireRound = [&](unsigned at) {
+            FireGunShot(at);
             // Every shot plays the weapon's fire clip again on the body; the
             // pose it was in is blended out over 60 ms (no snap to frame 0).
             gunPrevShotAt = gunLastShotAt;
-            gunLastShotAt = tnow;
+            gunLastShotAt = at;
             --gunAmmo;
-            gunNextShotAt = tnow + (unsigned)(1000.f / (std::max)(gunRate, 0.1f));
+        };
+        if (gunFiring && tnow >= gunNextShotAt) {
+            const unsigned cycle = (unsigned)(1000.f / (std::max)(gunRate, 0.1f));
+            if (gunRayGroups <= 1) {
+                fireRound(tnow);
+                gunNextShotAt = tnow + cycle;
+            } else {
+                // A burst: every round at its own fireTime, one after another.
+                float span = 0.f;
+                for (int g = 0; g < gunRayGroups && g < (int)gunRoundOffsets.size(); ++g) {
+                    gunPendingRounds.push_back({ tnow + (unsigned)gunRoundOffsets[g], g });
+                    span = (std::max)(span, gunRoundOffsets[g]);
+                }
+                const float spacing = gunRayGroups > 1 ? span / (float)(gunRayGroups - 1) : 0.f;
+                gunNextShotAt = tnow + (std::max)(cycle, (unsigned)(span + spacing));   // no overlap: the next burst follows the last round
+            }
+        }
+        if (!gunFiring) gunPendingRounds.clear();   // letting go of the trigger ends the burst
+        for (size_t i = 0; i < gunPendingRounds.size(); ) {
+            if (tnow < gunPendingRounds[i].at) { ++i; continue; }
+            const int g = gunPendingRounds[i].group;
+            gunPendingRounds.erase(gunPendingRounds.begin() + (long)i);
+            if (gunAmmo > 0 && !gunReloading) { gunForceGroup = g; fireRound(tnow); gunForceGroup = -1; }
+            else gunPendingRounds.clear();
         }
     }
     if (weaponOk && !weaponAnim.isGun) {
@@ -4389,6 +5247,13 @@ void WorldState::OnUpdate() {
             attackFired = true;
         }
         if (wantWeak && !atkParam && airState) { airAttack(game::IN_USE_WEAPON1_WEAK, false); wantWeak = false; }
+        // A click during a combo hit queues the next one (counter sword
+        // AfterDash1 -> 2 -> 3 -> 4, plasma FIRST -> SECOND -> THIRD): it
+        // starts once this hit's attack time (InitLua normal) is over.
+        if (wantWeak && atkParam && !atkStrongMode && !repeatWeak && weaponAnim.atkWeak.size() > 1 &&
+            atkParam >= &weaponAnim.atkWeak.front() && atkParam <= &weaponAnim.atkWeak.back()) {
+            weakQueued = true; wantWeak = false;
+        }
         if (wantWeak && !atkParam && canSwing && fsmAttack(game::IN_USE_WEAPON1_WEAK)) {
             // A weak hit thrown right after letting go of guard (right click) is a
             // counter instead of the next combo step.
@@ -4435,11 +5300,39 @@ void WorldState::OnUpdate() {
             if (!atkHitDone && t >= startDelay) {
                 atkHitDone = true;
                 // Online: whoever stands in front of the swing is hit.
-                HitPeersInCone(atkStrongMode ? 330.f : 280.f, atkStrongMode ? 15.f : 8.f, atkStrongMode ? 900.f : 400.f);
+                if (!swingAttacks) HitPeersInCone(atkStrongMode ? 330.f : 280.f, atkStrongMode ? 15.f : 8.f, atkStrongMode ? 900.f : 400.f);
                 float hs = atkStrongMode ? (isS1 ? atkHitStopStrong1 : atkHitStopStrong) : atkHitStopWeak;
                 if (hs > 0.f) hitStopUntil = tnow + (unsigned)hs;
             }
-            if (ended) { atkParam = nullptr; fastrunLockoutUntil = tnow + 120; }
+            // This combo hit and its DELAY row (recovery) after the attack time.
+            const bool weakHit = !atkStrongMode && !weaponAnim.atkWeak.empty() &&
+                                 atkParam >= &weaponAnim.atkWeak.front() && atkParam <= &weaponAnim.atkWeak.back();
+            const size_t hitIdx = weakHit ? (size_t)(atkParam - &weaponAnim.atkWeak.front()) : 0;
+            const anim::ActorAnim* delayRow = (weakHit && hitIdx < weaponAnim.atkWeakDelay.size() &&
+                                               !weaponAnim.atkWeakDelay[hitIdx].clip.empty()) ? &weaponAnim.atkWeakDelay[hitIdx] : nullptr;
+            const bool pastAttack = normalMs > 0.f ? sinceMs >= normalMs : (clipTicks > 0.f && t >= startDelay + clipTicks);
+            if (weakHit && weakQueued && pastAttack) {
+                // The queued click: next hit now, from where this one is.
+                weakQueued = false;
+                weakCombo = (int)((hitIdx + 1) % weaponAnim.atkWeak.size());
+                lastWeakAt = tnow;
+                atkParam = nullptr; atkCooldownUntil = 0;
+                startAtk(&weaponAnim.atkWeak[weakCombo], false);
+                ended = false; tick = 0.f;
+            }
+            if (ended) {
+                if (weakHit) lastWeakAt = tnow;   // the chain window counts from the end of the hit
+                weakQueued = false;
+                atkParam = nullptr; fastrunLockoutUntil = tnow + 120;
+            }
+            else if (delayRow && pastAttack && atkParam && !weakQueued) {
+                // Recovery: the DELAY row over the delay time.
+                const float dt = (sinceMs - (normalMs > 0.f ? normalMs : 0.f)) * animCtrl.speedScale * delayRow->rate;
+                const float dd = durOfClip(delayRow->clip);
+                curPose.clipA = delayRow->clip; curPose.tickA = (uint32_t)(dd > 0.f ? (std::min)(dt, dd) : dt);
+                curPose.loopA = false;
+                curPose.clipB.clear(); curPose.blend = 0.f;
+            }
             else {
                 curPose.clipA = atkParam->clip; curPose.tickA = (uint32_t)tick;
                 curPose.loopA = atkParam->loop;
@@ -4530,7 +5423,7 @@ void WorldState::OnUpdate() {
             // past (phase 1, or 250 ms into a single-phase action).
             if (!weapon2PeerHitDone && (weapon2Phase >= 1 || tnow - weapon2PhaseStart >= 250)) {
                 weapon2PeerHitDone = true;
-                HitPeersInCone(330.f, 15.f, 900.f);
+                if (!swingAttacks) HitPeersInCone(330.f, 15.f, 900.f);
             }
             float realDur = durOfClip(p->clip);
             float dur = realDur; if (dur <= 0.f) dur = 500.f;
@@ -4661,11 +5554,162 @@ void WorldState::OnUpdate() {
         const PendingSeq ps = pendingSeqs[i];
         pendingSeqs.erase(pendingSeqs.begin() + (long)i);
         float fx_ = std::sin(charYaw), fz_ = std::cos(charYaw);
+        const size_t beforeFx = activeEffects.size();
         if (!ps.file.empty())
             SpawnSeq(ps.file, charPos[0], charPos[1], charPos[2], charYaw + 3.14159265f);   // .seq is authored from the actor root (feet)
+        // AddInstantEffect: on its node of the worn item (Iron Boots R_boo_Dummy*).
+        if (!ps.node.empty() && activeEffects.size() > beforeFx) activeEffects.back().attachNode = ps.node;
+        // AddSequence index 2 (only the plasma dash: skill_swordman_battack):
+        // centred on the actor - its dome is authored 156 ahead of the root,
+        // which left the dash running out of it.
+        if (ps.index == 2 && activeEffects.size() > beforeFx) {
+            ActiveEffect& ne = activeEffects.back();
+            for (const EffectModel& em : ne.models) {
+                bool done = false;
+                for (const scn::Model& m : em.model.models)
+                    // Shifted by its own offset once more along the same axis:
+                    // the opposite sign moved it further behind (user test).
+                    if (!m.vertices.empty()) { ne.offX = m.matrix[12]; ne.offZ = m.matrix[14]; done = true; break; }
+                if (done) break;
+            }
+            // 1.5x (user test: bigger, so it covers the actor; the scale also
+            // carries the dome a bit further ahead, 156 -> 234).
+            ne.localScale = 1.5f;
+        }
         if (!ps.sound.empty()) audio::PlayEffect(ps.sound, 0.9f);
         DbgLog("[weapon-lua] sequence '%s' + '%s' fired", ps.file.c_str(), ps.sound.c_str());
     }
+
+    // Push from a hit (AddPushCondition): speed easing to zero over its time.
+    if (pushEnd > pushStart && tnow < pushEnd) {
+        const float k = 1.f - float(tnow - pushStart) / float(pushEnd - pushStart);
+        moveCtrl.MoveXZ(hitWall, ms, pushVX * k * dt, pushVZ * k * dt);
+        charPos[0] = ms.x; charPos[2] = ms.z;
+    }
+
+    // Reaction to a hit taken: the body is the reaction's (input is locked,
+    // see `reacting`). Clips from actorstates_gameplay.lua by their labels.
+    if (reactKind != REACT_NONE) {
+        auto row = [&](const char* fn, const char* label) -> const anim::ActorAnim* {
+            const anim::ActorFunc* f = luaStates.Func(fn);
+            if (!f) return nullptr;
+            const std::string want = std::string("ANIMPARAMLIST_") + label;
+            for (const anim::ActorAnim& a : f->anims) if (a.label == want && !a.clip.empty()) return &a;
+            return nullptr;
+        };
+        // Plays a row from `since` ms; returns true once a non-looping clip is done.
+        auto play = [&](const std::string& clip, float rate, bool loop, float since) {
+            const float d = durOfClip(clip);
+            float t = since * animCtrl.speedScale * rate;
+            const bool done = !loop && d > 0.f && t >= d;
+            if (d > 0.f) t = loop ? std::fmod(t, d) : (std::min)(t, d);
+            curPose.clipA = clip; curPose.tickA = (uint32_t)t; curPose.loopA = loop;
+            curPose.clipB.clear(); curPose.blend = 0.f;
+            curLowerPoseActive = false;
+            return done;
+        };
+        auto playRow = [&](const anim::ActorAnim* a, float since) { return a ? play(a->clip, a->rate, a->loop, since) : true; };
+        auto nextPhase = [&]() { ++reactPhase; reactPhaseStart = tnow; };
+        const float since = float(tnow - reactPhaseStart);
+        switch (reactKind) {
+        case REACT_FLINCH:
+            if (play(reactFlinchClip, 1.f, false, since)) reactKind = REACT_NONE;
+            break;
+        case REACT_STUN:
+            if (reactPhase == 0) { if (playRow(row("ActorState_Stun", "PRECEDING"), since)) nextPhase(); }
+            else { playRow(row("ActorState_Stun", "STUN"), since); }
+            if (tnow >= reactEnd) reactKind = REACT_NONE;
+            break;
+        case REACT_BLOW: {
+            // In the air: begin, then the middle loop; on landing the end row,
+            // then Down and Standup.
+            if (reactPhase <= 1) {
+                moveCtrl.MoveXZ(hitWall, ms, reactVX * dt, reactVZ * dt);
+                charPos[0] = ms.x; charPos[2] = ms.z;
+                if (!grounded) reactLeftGround = true;
+                if (reactPhase == 0) { if (playRow(row("ActorState_Blow", "BEGIN_NORMAL"), since)) nextPhase(); }
+                else playRow(row("ActorState_Blow", "MIDDLE_NORMAL"), since);
+                if (reactLeftGround && grounded) { reactPhase = 2; reactPhaseStart = tnow; }
+            } else if (reactPhase == 2) {
+                if (playRow(row("ActorState_Blow", "END_NORMAL"), since)) { reactKind = REACT_DOWN; reactPhase = 0; reactPhaseStart = tnow; reactEnd = tnow + 800; }
+            }
+            break;
+        }
+        case REACT_UPPERCUT:
+            // ActorState_UpperCut: NORMAL (GR005) in the air, END (GR006) once
+            // landed (S10 CUpperCutState::Update 0x010F3DD0 phase 1 -> 2).
+            if (reactPhase == 0) {
+                moveCtrl.MoveXZ(hitWall, ms, reactVX * dt, reactVZ * dt);
+                charPos[0] = ms.x; charPos[2] = ms.z;
+                if (!grounded) reactLeftGround = true;
+                playRow(row("ActorState_UpperCut", "NORMAL"), since);
+                if (reactLeftGround && grounded) { reactPhase = 1; reactPhaseStart = tnow; }
+            } else if (playRow(row("ActorState_UpperCut", "END"), since)) reactKind = REACT_NONE;
+            break;
+        case REACT_DOWN:
+            playRow(row("ActorState_Down", "NORMAL"), since);
+            if (tnow >= reactEnd) { reactKind = REACT_STANDUP; reactPhase = 0; reactPhaseStart = tnow; }
+            break;
+        case REACT_STANDUP:
+            if (playRow(row("ActorState_Standup", "NORMAL"), since)) reactKind = REACT_NONE;
+            break;
+        case REACT_DEATH:
+            playRow(row("ActorState_Death", "FALLDOWN_NORMAL_WEAK"), since);
+            if (tnow >= reactEnd) {   // back at full health on a spawn point
+                reactKind = REACT_NONE;
+                myHp = myHpMax;
+                if (!spawnPoints.empty()) {
+                    const auto& sp = spawnPoints[tnow % spawnPoints.size()];
+                    charPos[0] = sp[0]; charPos[1] = sp[1]; charPos[2] = sp[2];
+                    velX = velZ = velY = 0.f; grounded = false;
+                }
+            }
+            break;
+        default: reactKind = REACT_NONE; break;
+        }
+    }
+
+    // The shape change is done: the other form, read again from the scripts
+    // (every state's SHAPECHNAGE_* rows, the CHANGE_NORMAL idle, the revert pair).
+    if (weaponChangePending && !weapon2Active) {
+        weaponChangePending = false;
+        anim::SetShapeChange(!anim::ShapeChange());
+        animCtrl.LoadFromLua(luaStates, weaponStates.c_str(), weaponNormalAs.c_str(), weaponRunAs.c_str());
+        weaponAnim = anim::ResolveWeaponAnim(luaStates.parsed(), weaponStates, &luaStates.attackMap(), &luaStates.attribMap(),
+                                             weaponRows.empty() ? nullptr : &weaponRows);
+        DbgLog("[weapon] shape change -> %s", anim::ShapeChange() ? "transformed" : "normal");
+    }
+
+    // The swing's attacks, each at its own fireTime (weapon_*.lua CreateCAttack).
+    ProcessSwingAttacks(tnow);
+    UpdateClones(tnow, dt);
+
+    // Characters are solid: pushed out of the clones and the other players on
+    // this map, the character collision radius (COLL_R) each, respecting walls.
+    {
+        const float R = 2.f * moveCtrl.tuning().COLL_R;
+        float px = 0.f, pz = 0.f; bool any = false;
+        auto push = [&](float ox, float oy, float oz) {
+            if (std::fabs(oy - charPos[1]) > 170.f) return;   // a body's height: above / below does not block
+            float dx = charPos[0] - ox, dz = charPos[2] - oz;
+            const float d2 = dx*dx + dz*dz;
+            if (d2 >= R*R) return;
+            float d = std::sqrt(d2);
+            if (d < 1e-3f) { dx = 1.f; dz = 0.f; d = 1.f; }
+            const float k = (R - std::sqrt(d2)) / d;
+            px += dx * k; pz += dz * k; any = true;
+        };
+        for (const Clone& c : clones) push(c.pos[0], c.pos[1] + c.lift, c.pos[2]);
+        if (mpOnline && mpClient.Connected() && mapIdx >= 0 && mapIdx < (int)maps.size())
+            for (auto& kv : mpClient.Peers())
+                if (kv.second.hasPos && kv.second.map == maps[mapIdx].name) push(kv.second.rx, kv.second.ry, kv.second.rz);
+        if (any) {
+            ms.x = charPos[0]; ms.z = charPos[2];
+            moveCtrl.MoveXZ(hitWall, ms, px, pz);
+            charPos[0] = ms.x; charPos[2] = ms.z;
+        }
+    }
+    if (!atkParam && !weapon2Active) swingAttacks = nullptr;
 
     // Whatever ended the swing (clip done, weapon swap, guard cancelled), the
     // attack state hands back to STANDBY - the next STOP/MOVE resolves it.
@@ -4675,6 +5719,21 @@ void WorldState::OnUpdate() {
     // Unique weapon states sometimes use AS000_1/E0018_1 variants absent from
     // the shared skeleton. An invalid clip falls back to bind matrices (T-pose),
     // so use the matching base clip when it exists.
+    // CAnimParam:SetAniNameForHuman(clip, alt, true): the per-sex clip ("use it if
+    // the animation needs adjusting by sex" - the Death Scythe idle GR000 ->
+    // GR000_1 for the female character), from every state that declares one.
+    if (female) {
+        if (!humanAltBuilt) {
+            humanAltBuilt = true;
+            for (const auto& kv : luaStates.parsed())
+                for (const anim::ActorHumanName& h : kv.second.human)
+                    if (h.flag && !h.clip.empty() && !h.alt.empty()) humanAlt[h.clip] = h.alt;
+        }
+        for (std::string* c : { &curPose.clipA, &curPose.clipB }) {
+            auto it = humanAlt.find(*c);
+            if (it != humanAlt.end() && ClipDurationMs(character, it->second) > 0) *c = it->second;
+        }
+    }
     const char* standbyFallback = (st == anim::STATE_NORMAL || st == anim::STATE_IDLE) ? "00074" : nullptr;
     NormalizeCharacterClip(character, curPose.clipA, standbyFallback);
     NormalizeCharacterClip(character, curPose.clipB, standbyFallback);
@@ -4708,10 +5767,11 @@ void WorldState::OnUpdate() {
             // D0004 front, D0006 left ... each with its own blendIn/Out): a
             // direction change is a new SetBlendingAnim and cross-fades like
             // any other, torso and legs, with that row's times.
-            const std::string dir = ac.moving ? anim::RunDir(ac.inX, ac.inZ) : std::string("NORMAL");
+            const std::string dir = !grounded ? std::string(velY > 0.f ? "JUMP" : "FLY")
+                                  : ac.moving ? anim::RunDir(ac.inX, ac.inZ) : std::string("NORMAL");
             key = "gun:" + std::to_string(gunFireStart) + ":" + dir;
             if (const anim::BlendSlot* slot = anim::WeaponFireBlendSlot(luaStates.parsed(), weaponStates)) {
-                const float vp = (std::max)(-0.35f, (std::min)(1.2f, camPitch + lookPitch));
+                const float vp = (std::max)(kPitchUp, (std::min)(kPitchDown, camPitch + lookPitch));
                 const auto& half = (-vp > 0.f || slot->lower.empty()) ? slot->upper : slot->lower;
                 const anim::ActorBlend* blend = nullptr;
                 auto it = half.find(dir);
@@ -4800,16 +5860,49 @@ void WorldState::UpdateOnline(unsigned nowMs, float dt) {
     for (const mp::ChatLine& c : mpClient.TakeChat()) DbgLog("[chat] %s: %s", c.nickname.c_str(), c.text.c_str());
     for (const mp::Shot& s : mpClient.TakeShots()) PlayPeerShot(s);
     for (const mp::Hurt& h : mpClient.TakeHurts()) {
+        if (reactKind == REACT_DEATH) continue;
         myHp -= h.dmg;
         hurtFlashUntil = nowMs + 250;
-        DbgLog("[mp] hurt %.0f from %d -> hp %.0f", h.dmg, h.fromId, myHp);
-        if (myHp <= 0.f) {   // down: back at full health on a spawn point
-            myHp = myHpMax;
-            if (!spawnPoints.empty()) {
-                const auto& sp = spawnPoints[nowMs % spawnPoints.size()];
-                charPos[0] = sp[0]; charPos[1] = sp[1]; charPos[2] = sp[2];
-                velX = velZ = velY = 0.f; grounded = false;
-            }
+        DbgLog("[mp] hurt %.0f from %d -> hp %.0f stun=%.0f blow=%.0f/%.0f crit=%d", h.dmg, h.fromId, myHp, h.stunMs, h.blowDist, h.blowPower, (int)h.crit);
+        // Away from the attacker, on the ground.
+        float ax = charPos[0] - h.fromX, az = charPos[2] - h.fromZ;
+        const float al = std::sqrt(ax*ax + az*az);
+        if (al > 1e-3f) { ax /= al; az /= al; } else { ax = -std::sin(charYaw); az = -std::cos(charYaw); }
+        // AddPushCondition: slid away from the attacker at its speed for its time
+        // (slowing to a stop), on top of whatever reaction follows.
+        if (h.knock > 0.f && h.pushMs > 0.f) {
+            pushVX = ax * h.knock; pushVZ = az * h.knock;
+            pushStart = nowMs; pushEnd = nowMs + (unsigned)h.pushMs;
+        }
+        if (myHp <= 0.f) {
+            // ActorState_Death, then back at full health on a spawn point.
+            StartReaction(REACT_DEATH, nowMs, 2500);
+        } else if (h.blowPower > 0.f || h.blowDist != 0.f) {
+            // AddBlowCondition(dist, power): knocked off the feet (ActorState_Blow
+            // -> Down -> Standup), launched at dist away from the attacker
+            // (negative: towards it) and power upwards - S10 CBlowCondition::Apply
+            // 0x00FD5890 (same speed units as jump_force 2700).
+            reactVX = ax * h.blowDist; reactVZ = az * h.blowDist;
+            velY = h.blowPower; grounded = false;
+            StartReaction(REACT_BLOW, nowMs, 0);
+        } else if (h.stunMs > 0.f) {
+            // AddStunCondition: ActorState_Stun for the time the hit decided.
+            StartReaction(REACT_STUN, nowMs, (unsigned)h.stunMs);
+            if (const anim::ActorFunc* f = luaStates.Func("ActorState_Stun"))
+                for (const anim::ActorSeq& q : f->seqs) {
+                    SpawnSeq(q.seq, charPos[0], charPos[1], charPos[2], charYaw + 3.14159265f);
+                    if (!q.sound.empty()) audio::PlayEffect(q.sound, 0.85f);
+                    break;
+                }
+        } else {
+            // A plain hit: the weapon's DamageState_<X> row for the side it came from.
+            const float fx = std::sin(charYaw), fz = std::cos(charYaw);
+            const float toAx = -ax, toAz = -az;   // towards the attacker
+            const float front = toAx * fx + toAz * fz, side = toAx * fz - toAz * fx;
+            const char* dir = std::fabs(front) >= std::fabs(side) ? (front >= 0.f ? "FRONT" : "BACK") : (side >= 0.f ? "LEFT" : "RIGHT");
+            auto it = weaponAnim.dmg.find(dir);
+            if (it == weaponAnim.dmg.end()) it = weaponAnim.dmg.find("FRONT");
+            if (it != weaponAnim.dmg.end() && !it->second.clip.empty()) { reactFlinchClip = it->second.clip; StartReaction(REACT_FLINCH, nowMs, 0); }
         }
     }
     if (nowMs >= mpNextSendMs) {
@@ -4840,11 +5933,11 @@ const std::vector<WorldState::WeaponRenderPart>& WorldState::PeerWeaponParts(con
     if (it != peerWeapons.end()) return it->second;
     std::vector<WeaponRenderPart> parts;
     const std::optional<int> typeId = file.empty() ? std::nullopt
-        : data::TypeFromSuffix("resources", states, luaStates.attackMap().typeBySuffix);
+        : data::TypeFromSuffix(respath::Root(), states, luaStates.attackMap().typeBySuffix);
     auto build = [&](const std::string& f, int row) {
         WeaponRenderPart part;
         part.sceneIndex = row;
-        part.scene = scn::Parse(("resources/resources/model/weapon/" + f).c_str());
+        part.scene = scn::Parse((RES("resources/resources/model/weapon/") + f).c_str());
         if (!part.scene.ok || part.scene.models.empty()) return;
         auto isNode = [&](const std::string& name) {
             for (const scn::Model& m : part.scene.models) if (m.name == name) return true;
@@ -4864,10 +5957,12 @@ const std::vector<WorldState::WeaponRenderPart>& WorldState::PeerWeaponParts(con
         // Same rules as our own primary piece (EquipWeaponFile): the table's
         // bone, else the one deduced from the mount name (smash: Gun_Dummy);
         // link=1 pieces hang as authored, no mount inverse.
-        part.attackBone = typeId ? data::AttachBone("resources", *typeId, row, false) : "";
+        part.attackBone = typeId ? data::AttachBone(respath::Root(), *typeId, row, false) : "";
         if (part.attackBone.empty()) part.attackBone = row ? std::string("L_Hand_Dummy") : WeaponBoneFromMount(part.mountName);
-        part.idleBone = part.attackBone;
-        if (typeId && data::AttachLink("resources", *typeId, row) == 1) {
+        // Holstered bone (sprint, jump, dodge, sit): the table's idle row, as ours.
+        part.idleBone = typeId ? data::AttachBone(respath::Root(), *typeId, row, true) : "";
+        if (part.idleBone.empty()) part.idleBone = part.attackBone;
+        if (typeId && data::AttachLink(respath::Root(), *typeId, row) == 1) {
             const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             std::memcpy(part.invMount, id, sizeof(id));
             part.mountName.clear();
@@ -4878,12 +5973,143 @@ const std::vector<WorldState::WeaponRenderPart>& WorldState::PeerWeaponParts(con
         std::string rightStem, leftStem;
         const std::string stem = std::filesystem::path(file).stem().string();
         build(file, 0);
-        if (SplitWeaponPair(stem, rightStem, leftStem) && std::filesystem::exists("resources/resources/model/weapon/" + leftStem + ".scn"))
+        if (SplitWeaponPair(stem, rightStem, leftStem) && std::filesystem::exists(RES("resources/resources/model/weapon/") + leftStem + ".scn"))
             build(leftStem + ".scn", 1);
     }
     DbgLog("[mp] peer weapon '%s' states='%s' type=%d pieces=%zu bone='%s'", file.c_str(), states.c_str(), typeId ? *typeId : -1,
            parts.size(), parts.empty() ? "" : parts[0].attackBone.c_str());
     return peerWeapons.emplace(key, std::move(parts)).first->second;
+}
+
+// The clone's reaction to our hit: a plain hit plays our weapon's
+// DamageState FRONT row; a blow launches it (dist away from us, power up),
+// it lands on ActorState_Blow END and gets up with ActorState_Standup, then
+// goes back to the pose it was left in.
+void WorldState::CloneHit(Clone& c, float dmg, float stunMs, float blowDist, float blowPower, unsigned tnow) {
+    (void)stunMs;
+    if (blowPower > 0.f || blowDist != 0.f) {
+        float ax = c.pos[0] - charPos[0], az = c.pos[2] - charPos[2];
+        const float al = std::sqrt(ax*ax + az*az);
+        if (al > 1e-3f) { ax /= al; az /= al; } else { ax = std::sin(charYaw); az = std::cos(charYaw); }
+        c.vx = ax * blowDist; c.vz = az * blowDist; c.vy = blowPower;
+        c.react = 2;
+    } else if (c.react == 0 || c.react == 1) {
+        auto it = weaponAnim.dmg.find("FRONT");
+        if (it != weaponAnim.dmg.end() && !it->second.clip.empty()) { c.reactClip = it->second.clip; c.react = 1; }
+    }
+    c.reactStart = tnow;
+    DbgLog("[clone] hit %.1f blow=%.0f/%.0f", dmg, blowDist, blowPower);
+}
+
+void WorldState::UpdateClones(unsigned tnow, float dt) {
+    for (Clone& c : clones) {
+        if (c.react != 2) continue;
+        // Ballistic flight under the movement's gravity (GRAV 7500).
+        c.pos[0] += c.vx * dt; c.pos[2] += c.vz * dt;
+        c.lift += c.vy * dt; c.vy -= moveCtrl.tuning().GRAV * dt;
+        if (c.lift <= 0.f && c.vy < 0.f) { c.lift = 0.f; c.vy = 0.f; c.react = 3; c.reactStart = tnow; }
+    }
+}
+
+// V (and a new map): the clones go, with their frozen effects and GPU meshes.
+void WorldState::ReleaseClones(IRenderer* r) {
+    for (Clone& c : clones) for (const Clone::Baked& b : c.baked) cloneMeshesToFree.push_back(b.mesh);
+    clones.clear();
+    activeEffects.erase(std::remove_if(activeEffects.begin(), activeEffects.end(), [](const ActiveEffect& e) { return e.frozen; }),
+                        activeEffects.end());
+    if (r) { for (int m : cloneMeshesToFree) r->ReleaseStaticMesh(m); cloneMeshesToFree.clear(); }
+}
+
+void WorldState::DrawClones(IRenderer* r) {
+    if (!loaded) return;
+    for (int m : cloneMeshesToFree) r->ReleaseStaticMesh(m);
+    cloneMeshesToFree.clear();
+    for (Clone& c : clones) DrawClone(r, c);
+}
+
+void WorldState::DrawClone(IRenderer* r, Clone& c) {
+    const unsigned now = GetTickCount();
+    auto row = [&](const char* fn, const char* label) -> std::string {
+        if (const anim::ActorFunc* f = luaStates.Func(fn))
+            for (const anim::ActorAnim& a : f->anims) if (a.label == std::string("ANIMPARAMLIST_") + label && !a.clip.empty()) return a.clip;
+        return std::string();
+    };
+    // Where it is now: its own position plus the lift of a blow.
+    const float pos[3] = { c.pos[0], c.pos[1] + c.lift, c.pos[2] };
+
+    // Reaction pose (flinch / blown / getting up): played live.
+    scn::AnimPose pose = c.pose;
+    float since = -1.f;
+    const float sinceReact = float(now - c.reactStart);
+    auto oneShot = [&](const std::string& clip, float t) {
+        const float d = (float)ClipDurationMs(character, clip);
+        if (clip.empty() || d <= 0.f || t * animCtrl.speedScale >= d) return false;
+        pose.clipA = clip; pose.loopA = false; since = t; return true;
+    };
+    if (c.react == 1 && !oneShot(c.reactClip, sinceReact)) c.react = 0;
+    if (c.react == 2) {
+        const std::string mid = row("ActorState_Blow", "MIDDLE_NORMAL");
+        if (!oneShot(row("ActorState_Blow", "BEGIN_NORMAL"), sinceReact) && !mid.empty()) { pose.clipA = mid; pose.loopA = true; since = sinceReact; }
+    }
+    if (c.react == 3) {
+        const std::string end = row("ActorState_Blow", "END_NORMAL"), up = row("ActorState_Standup", "NORMAL");
+        const float endMs = (float)ClipDurationMs(character, end) / animCtrl.speedScale;
+        if (!oneShot(end, sinceReact) && !oneShot(up, sinceReact - endMs)) c.react = 0;
+    }
+
+    if (c.react == 0 || since < 0.f) {
+        // Held pose: built once as GPU meshes at the origin, then only moved.
+        if (!c.bakedDone) {
+            c.bakedDone = true;
+            std::vector<IRenderer::CapturedMesh> cap;
+            const float origin[3] = { 0.f, 0.f, 0.f };
+            float place0[16]; BuildYawTranslate(c.yaw + 3.14159265f, origin, place0);
+            const scn::AnimPose* lower = c.lowerActive ? &c.lowerPose : nullptr;
+            std::vector<CharPiece> pieces;
+            const unsigned hideSlot = weaponOk ? WornSlotMask() : 0u;
+            GatherCharacterPieces(character, bodyParts, c.pose, pieces, lower, hideSlot);
+            if (weaponOk) GatherCharacterPieces(character, weaponWornParts, c.pose, pieces, lower);
+            r->SetMeshCapture(&cap);
+            DrawCharPieces(r, pieces, place0);
+            if (weaponOk) DrawWeaponParts(r, c.pose, place0, true, lower);
+            r->SetMeshCapture(nullptr);
+            for (const IRenderer::CapturedMesh& m : cap) {
+                Clone::Baked b;
+                b.mesh = r->CreateStaticMesh(m.verts.data(), 5, m.vertCount, m.idx.data(), (int)m.idx.size());
+                if (b.mesh < 0) continue;
+                b.tris = (int)m.idx.size() / 3; b.tex = m.tex; b.flags = m.flags;
+                std::memcpy(b.world, m.world, sizeof(b.world));
+                c.baked.push_back(b);
+            }
+            DbgLog("[clone] baked %zu meshes", c.baked.size());
+        }
+        float move[16]; BuildYawTranslate(0.f, pos, move);
+        for (const Clone::Baked& b : c.baked) {
+            float w[16]; Mat4MulS(b.world, move, w);
+            r->DrawStaticMesh(b.mesh, 0, b.tris, b.tex, -1, w, b.flags);
+        }
+    } else {
+        // Live: the reaction clip, our body and weapon.
+        pose.tickA = (uint32_t)(since * animCtrl.speedScale); pose.clipB.clear(); pose.blend = 0.f;
+        float place[16]; BuildYawTranslate(c.yaw + 3.14159265f, pos, place);
+        std::vector<CharPiece> pieces;
+        const unsigned hideSlot = weaponOk ? WornSlotMask() : 0u;
+        GatherCharacterPieces(character, bodyParts, pose, pieces, nullptr, hideSlot);
+        if (weaponOk) GatherCharacterPieces(character, weaponWornParts, pose, pieces, nullptr);
+        DrawCharPieces(r, pieces, place);
+        if (weaponOk) DrawWeaponParts(r, pose, place, true, nullptr);
+    }
+
+    // The weapon trail it had, as it was (drawn at the instant it was left).
+    if (c.ghostTrail && c.ghostSamples.size() >= 2) {
+        std::swap(ghostSamples, c.ghostSamples);
+        const anim::ActorGhostTrail* gt = ghostTrail; const unsigned gs = ghostStart;
+        ghostTrail = c.ghostTrail; ghostStart = c.ghostStart;
+        DrawGhostTrail(r, c.ghostAt);
+        c.ghostTrail = ghostTrail;
+        ghostTrail = gt; ghostStart = gs;
+        std::swap(ghostSamples, c.ghostSamples);
+    }
 }
 
 void WorldState::DrawPeers(IRenderer* r) {
@@ -4927,15 +6153,34 @@ void WorldState::DrawPeers(IRenderer* r) {
         std::vector<CharPiece> pieces;
         GatherCharacterPieces(*skel, *parts, pose, pieces, nullptr);
         DrawCharPieces(r, pieces, place);
-        // Their weapon, in hand, rigid pieces: piece * mount inverse * hand bone * place.
+        // The states that holster the weapon (ActorFsm::WeaponPoseFor: FASTRUN,
+        // JUMP, BOUNDJUMP, FALL, DODGE, SIT) told apart by the clip they play,
+        // read from those states' own rows in actorstates_gameplay.lua.
+        if (peerHolsterClips.empty())
+            for (const char* fn : { "ActorState_Jump", "ActorState_BoundJump", "ActorState_Fall", "ActorState_Dodge",
+                                    "ActorState_FastRun", "ActorState_Sit" })
+                if (const anim::ActorFunc* f = luaStates.Func(fn))
+                    for (const anim::ActorAnim& a : f->anims) if (!a.clip.empty()) peerHolsterClips.insert(a.clip);
+        const bool holstered = peerHolsterClips.count(pose.clipA) != 0;
+        // Their weapon, rigid pieces: piece * mount inverse * hand (or holster) bone * place.
         for (const WeaponRenderPart& part : PeerWeaponParts(p.weapon, p.weaponStates)) {
+            const bool holsterThis = holstered && part.idleBone != part.attackBone;
             float hand[16];
-            if (!scn::BoneWorldByName(*skel, part.attackBone, pose, hand)) continue;
-            float toHand[16]; Mat4MulS(part.invMount, hand, toHand);
+            if (!scn::BoneWorldByName(*skel, holsterThis ? part.idleBone : part.attackBone, pose, hand)) continue;
+            float handAligned[16];
+            std::memcpy(handAligned, hand, sizeof(handAligned));
+            if (holsterThis && part.idleBone == "Gun_Dummy") {
+                if (part.holsterState == 0 || part.holsterGen != gHolsterGen) {
+                    part.holsterGen = gHolsterGen;
+                    part.holsterState = HolsterBarrelDown(part.scene, part.invMount, *skel, part.idleBone, part.mountName, part.holsterRot) ? 1 : 2;
+                }
+                if (part.holsterState == 1) HolsterWithSwing(*skel, hand, part.holsterRot, handAligned);
+            }
+            float toHand[16]; Mat4MulS(part.invMount, handAligned, toHand);
             // The weapon plays the clip the peer's body plays when it has it
             // (smash rifle DD000.. place its pieces), else its default clip -
             // MakeWeaponPose, as for our own weapon.
-            const scn::AnimPose weaponPose = MakeWeaponPose(part.scene, anim::WeaponAnim{}, pose, anim::STATE_NORMAL, false, 0.f, 0.f, nullptr, false, false);
+            const scn::AnimPose weaponPose = MakeWeaponPose(part.scene, anim::WeaponAnim{}, pose, anim::STATE_NORMAL, false, 0.f, 0.f, nullptr, false, holsterThis);
             const bool animateWeapon = !weaponPose.clipA.empty() || !weaponPose.fallbackClip.empty() || !part.scene.animNames.empty();
             const scn::NodeResolver weaponNodes = animateWeapon ? scn::MakeNodeResolver(part.scene, weaponPose, true) : scn::NodeResolver{};
             // A mount moved by that clip is cancelled where it is now (DrawWeaponParts).
@@ -4951,7 +6196,7 @@ void WorldState::DrawPeers(IRenderer* r) {
                 if (haveBase) {
                     float diff = 0.f;
                     for (int k = 0; k < 15; ++k) diff = (std::max)(diff, std::fabs(now[k] - baseW[k]) / (k >= 12 ? 1.f : 0.02f));
-                    if (diff > 1.f) { const scn::Mat4 invNow = scn::Mat4InvAffine(now); Mat4MulS(invNow.data(), hand, toHand); }
+                    if (diff > 1.f) { const scn::Mat4 invNow = scn::Mat4InvAffine(now); Mat4MulS(invNow.data(), handAligned, toHand); }
                 }
             }
             for (size_t mi = 0; mi < part.scene.models.size(); ++mi) {
@@ -4977,6 +6222,75 @@ void WorldState::DrawPeers(IRenderer* r) {
     }
 }
 
+// The blade trail of state:AddGhostTrail. Values are the beta's CWeapon ->
+// Game::CActor::MakeGhostTrailNode(Line01, name, texture, 200, 50.f, 50, 100,
+// 0, blend) into CGhostTrailData: LifeTime 200 ms, UnitLength 50, FadeInTime
+// 50, FadeOutTime 100; texture gi.tga (the _02 trail gi2.tga, the bat
+// bi_atex.tga), additive except the bat's (blend arg 1 -> alpha).
+void WorldState::DrawGhostTrail(IRenderer* r, unsigned tnow) {
+    const unsigned kLifeMs = 200, kFadeInMs = 50, kFadeOutMs = 100;
+    const float kUnitLength = 50.f;
+    while (!ghostSamples.empty() && tnow - ghostSamples.front().t > kLifeMs) ghostSamples.erase(ghostSamples.begin());
+    if (!r || !ghostTrail || ghostSamples.size() < 2) return;
+    // Whole-trail fade: in over FadeInTime from the window start, out over
+    // FadeOutTime after its end.
+    const float age = (float)(tnow - ghostStart);
+    float fade = 1.f;
+    if (age < ghostTrail->startMs + (float)kFadeInMs) fade = (std::max)(0.f, (age - ghostTrail->startMs) / (float)kFadeInMs);
+    if (age > ghostTrail->endMs) fade = (std::min)(fade, 1.f - (age - ghostTrail->endMs) / (float)kFadeOutMs);
+    if (fade <= 0.f) {
+        if (age > ghostTrail->endMs + (float)kFadeOutMs) { ghostTrail = nullptr; ghostSamples.clear(); }
+        return;
+    }
+    const std::string& name = ghostTrail->name;
+    const bool bat = name.find("bat_sword") != std::string::npos;
+    const bool second = name.size() >= 3 && name.compare(name.size() - 3, 3, "_02") == 0;
+    const char* tex = bat ? RESC("resources/resources/image/bi_atex.tga")
+                    : second ? RESC("resources/resources/image/gi2.tga") : RESC("resources/resources/image/gi.tga");
+    // Samples come once per frame; at a fast swing the blade jumps far between
+    // them, so the strip is cut into UnitLength pieces along a Catmull-Rom
+    // through the samples (both edges), like the node's unit subdivision.
+    auto cr = [](const float* p0, const float* p1, const float* p2, const float* p3, float t, float* o) {
+        const float t2 = t * t, t3 = t2 * t;
+        for (int k = 0; k < 3; ++k)
+            o[k] = 0.5f * (2.f*p1[k] + (-p0[k] + p2[k]) * t + (2.f*p0[k] - 5.f*p1[k] + 4.f*p2[k] - p3[k]) * t2 + (-p0[k] + 3.f*p1[k] - 3.f*p2[k] + p3[k]) * t3);
+    };
+    std::vector<float> v;   // x,y,z,u,v
+    const size_t n = ghostSamples.size();
+    auto emit = [&](const float* a, const float* b, float sampleAge) {
+        const float u = (std::min)(1.f, sampleAge / (float)kLifeMs);
+        v.insert(v.end(), { a[0], a[1], a[2], u, 0.f, b[0], b[1], b[2], u, 1.f });
+    };
+    for (size_t i = n; i-- > 0; ) {   // newest first
+        const GhostSample& s1 = ghostSamples[i];
+        emit(s1.a, s1.b, (float)(tnow - s1.t));
+        if (i == 0) break;
+        const GhostSample& s2 = ghostSamples[i - 1];
+        const GhostSample& s0 = ghostSamples[i + 1 < n ? i + 1 : i];
+        const GhostSample& s3 = ghostSamples[i >= 2 ? i - 2 : i - 1];
+        const float dx = s2.b[0] - s1.b[0], dy = s2.b[1] - s1.b[1], dz = s2.b[2] - s1.b[2];
+        const int pieces = (std::min)(16, (int)std::ceil(std::sqrt(dx*dx + dy*dy + dz*dz) / kUnitLength));
+        for (int k = 1; k < pieces; ++k) {
+            const float t = (float)k / (float)pieces;
+            float a[3], b[3];
+            cr(s0.a, s1.a, s2.a, s3.a, t, a);
+            cr(s0.b, s1.b, s2.b, s3.b, t, b);
+            emit(a, b, (float)(tnow - s1.t) + t * (float)(s1.t - s2.t));
+        }
+    }
+    const int verts = (int)(v.size() / 5);
+    if (verts < 4) return;
+    std::vector<unsigned short> idx;
+    for (int q = 0; q + 3 < verts; q += 2) {
+        idx.insert(idx.end(), { (unsigned short)q, (unsigned short)(q + 1), (unsigned short)(q + 2),
+                                (unsigned short)(q + 1), (unsigned short)(q + 3), (unsigned short)(q + 2) });
+    }
+    r->meshFade = fade;
+    const uint32_t flags = scn::RF_NO_CULLING | scn::RF_NO_DEPTH_WRITE | (bat ? scn::RF_TRANSPARENT : 32u);
+    r->DrawMesh(v.data(), verts, idx.data(), (int)idx.size(), r->LoadTexture(tex), nullptr, flags);
+    r->meshFade = 1.f;
+}
+
 // The equipped weapon on the character: every piece hung from its bip bone
 // and posed by the weapon's own clip. preview = the inventory character:
 // always in hand, idle, no attack.
@@ -4984,6 +6298,7 @@ void WorldState::DrawWeaponParts(IRenderer* r, const scn::AnimPose& pose, const 
         const unsigned shotPoseMs = gunAnimMs > 0.f ? (unsigned)gunAnimMs : 200u;
         const bool isDodge = !preview && (animCtrl.state() == anim::STATE_DODGE_LEFT || animCtrl.state() == anim::STATE_DODGE_RIGHT);
         const bool shotPoseActive = !isDodge && (gunFiring || (gunLastShotAt && GetTickCount() - gunLastShotAt < shotPoseMs));
+        if (!preview) weaponNodeChar.clear();
         // Arma: cuelga del dummy del bip y sigue la animacion del personaje.
         // world = m.matrix * inv(dummyRaizDelArma) * huesoDelBip * place
         //
@@ -5006,8 +6321,18 @@ void WorldState::DrawWeaponParts(IRenderer* r, const scn::AnimPose& pose, const 
         std::string attachBoneName = selectedBone.empty() ? weaponBone : selectedBone;
         float hand[16];
         if (weaponOk && SkelBoneWorld(character, attachBoneName, pose, lowerPose, hand)) {
+            // Holstered on the thigh: barrel down (see HolsterBarrelDown).
+            float handAligned[16];
+            std::memcpy(handAligned, hand, sizeof(handAligned));
+            if (holsterThis && attachBoneName == "Gun_Dummy") {
+                if (part.holsterState == 0 || part.holsterGen != gHolsterGen) {
+                    part.holsterGen = gHolsterGen;
+                    part.holsterState = HolsterBarrelDown(part.scene, part.invMount, character, attachBoneName, part.mountName, part.holsterRot) ? 1 : 2;
+                }
+                if (part.holsterState == 1) HolsterWithSwing(character, hand, part.holsterRot, handAligned);
+            }
             float toHand[16];
-            Mat4MulS(part.invMount, hand, toHand);
+            Mat4MulS(part.invMount, handAligned, toHand);
             // Character and weapon SCNs use separate clip namespaces. Demonic
             // Knuckle, for example, uses KN000/KN001..KN008 while the body uses
             // 00074/00008..00015. Select the weapon's authored state first.
@@ -5042,7 +6367,7 @@ void WorldState::DrawWeaponParts(IRenderer* r, const scn::AnimPose& pose, const 
                     for (int k = 0; k < 15; ++k) diff = (std::max)(diff, std::fabs(now[k] - baseW[k]) / (k >= 12 ? 1.f : 0.02f));
                     if (diff > 1.f) {
                         const scn::Mat4 invNow = scn::Mat4InvAffine(now);
-                        Mat4MulS(invNow.data(), hand, toHand);
+                        Mat4MulS(invNow.data(), handAligned, toHand);
                     }
                 }
             }
@@ -5081,8 +6406,22 @@ void WorldState::DrawWeaponParts(IRenderer* r, const scn::AnimPose& pose, const 
                 const scn::Mat4* fw = animateWeapon ? weaponNodes(fireNode) : nullptr;
                 float nodeW[16], a[16], w[16];
                 bool have = false;
-                if (fw) { std::memcpy(nodeW, fw->data(), sizeof(nodeW)); have = true; }
-                else for (const scn::Bone& b : part.scene.bones) if (b.name == fireNode) { std::memcpy(nodeW, b.matrix, sizeof(nodeW)); have = true; break; }
+                // Some exports store a node's LOCAL transform as its matrix
+                // (handgun, smg_02, revolver_kid, hw_kid, railgun_kid: matrix ==
+                // its track's initT, parent = a model piece) - read raw it sits
+                // 50-2800 units off the gun. Composing the tracks up the parent
+                // chain (TrackWorld) is right for all 191 guns but the 2 whose
+                // node rides a skinned bone. Use the clip's position only when
+                // the clip really moves the node away from its stored matrix.
+                const scn::Bone* fireBone = nullptr;
+                for (const scn::Bone& b : part.scene.bones) if (b.name == fireNode) { fireBone = &b; break; }
+                bool clipMoves = false;
+                if (fw && fireBone) for (int k = 12; k < 15; ++k) if (std::fabs((*fw)[k] - fireBone->matrix[k]) > 0.5f) clipMoves = true;
+                scn::Mat4 trackW;
+                if (fw && (clipMoves || !fireBone)) { std::memcpy(nodeW, fw->data(), sizeof(nodeW)); have = true; }
+                else if (fireBone && scn::TrackWorld(part.scene, fireNode, trackW, true)) { std::memcpy(nodeW, trackW.data(), sizeof(nodeW)); have = true; }
+                else if (fw) { std::memcpy(nodeW, fw->data(), sizeof(nodeW)); have = true; }
+                else if (fireBone) { std::memcpy(nodeW, fireBone->matrix, sizeof(nodeW)); have = true; }
                 if (!have) for (const scn::Model& m : part.scene.models) if (m.name == fireNode) { std::memcpy(nodeW, m.matrix, sizeof(nodeW)); have = true; break; }
                 if (have) {
                     Mat4MulS(nodeW, toHand, a);
@@ -5102,6 +6441,54 @@ void WorldState::DrawWeaponParts(IRenderer* r, const scn::AnimPose& pose, const 
                         DbgLog("[muzzle] bone='%s' hand=(%.0f,%.0f,%.0f) model=(%.0f,%.0f,%.0f) fire=(%.0f,%.0f,%.0f) dist=%.0f clip=%s/%s fw=%d anim=%d",
                                attachBoneName.c_str(), hand[12], hand[13], hand[14], mw[12], mw[13], mw[14], w[12], w[13], w[14],
                                std::sqrt(dx*dx + dy*dy + dz*dz), pose.clipA.c_str(), pose.clipB.c_str(), (int)(fw != nullptr), (int)animateWeapon);
+                    }
+                }
+            }
+            // Weapon nodes the item's <sequence> effects hang from, as drawn.
+            if (!preview) {
+                for (const ActiveEffect& fx : activeEffects) {
+                    if (fx.tag == "costume" || fx.attachNode.empty()) continue;   // item <sequence> and AddInstantEffect
+                    float nodeW[16]; bool have = false;
+                    if (const scn::Mat4* nw = animateWeapon ? weaponNodes(fx.attachNode) : nullptr) { std::memcpy(nodeW, nw->data(), sizeof(nodeW)); have = true; }
+                    if (!have) for (size_t mi = 0; mi < part.scene.models.size(); ++mi) if (part.scene.models[mi].name == fx.attachNode) {
+                        std::memcpy(nodeW, mi < part.pieceWorlds.size() ? part.pieceWorlds[mi].data() : part.scene.models[mi].matrix, sizeof(nodeW));
+                        have = true; break;
+                    }
+                    if (!have) { scn::Mat4 tw; if (scn::TrackWorld(part.scene, fx.attachNode, tw, true)) { std::memcpy(nodeW, tw.data(), sizeof(nodeW)); have = true; } }
+                    if (!have) for (const scn::Bone& b : part.scene.bones) if (b.name == fx.attachNode) { std::memcpy(nodeW, b.matrix, sizeof(nodeW)); have = true; break; }
+                    if (have) { std::array<float, 16> c; Mat4MulS(nodeW, toHand, c.data()); weaponNodeChar[fx.attachNode] = c; }
+                }
+            }
+            // Ghost trail: Line01 (local to its parent piece) as the blade is
+            // drawn this frame, sampled while the state's AddGhostTrail window
+            // is open. The beta's CWeapon makes one trail per weapon file 0.
+            if (!preview && ghostTrail && part.sceneIndex == 0 && !part.scene.lines.empty()) {
+                const unsigned tnowG = GetTickCount();
+                const unsigned ageG = tnowG - ghostStart;
+                const scn::Line* ln = nullptr;
+                for (const scn::Line& l : part.scene.lines) if (l.name == "Line01" && l.pts.size() >= 6) { ln = &l; break; }
+                if (ln && ageG >= (unsigned)ghostTrail->startMs && ageG <= (unsigned)ghostTrail->endMs) {
+                    float parentW[16]; bool haveParent = false;
+                    if (const scn::Mat4* pw = animateWeapon ? weaponNodes(ln->parent) : nullptr) { std::memcpy(parentW, pw->data(), sizeof(parentW)); haveParent = true; }
+                    if (!haveParent) for (size_t mi = 0; mi < part.scene.models.size(); ++mi) if (part.scene.models[mi].name == ln->parent) {
+                        std::memcpy(parentW, mi < part.pieceWorlds.size() ? part.pieceWorlds[mi].data() : part.scene.models[mi].matrix, sizeof(parentW));
+                        haveParent = true; break;
+                    }
+                    if (!haveParent) for (const scn::Bone& b : part.scene.bones) if (b.name == ln->parent) { std::memcpy(parentW, b.matrix, sizeof(parentW)); haveParent = true; break; }
+                    if (haveParent) {
+                        float lw[16], a[16], w[16];
+                        Mat4MulS(ln->matrix, parentW, lw);
+                        Mat4MulS(lw, toHand, a);
+                        Mat4MulS(a, place, w);
+                        GhostSample s; s.t = tnowG;
+                        for (int e = 0; e < 2; ++e) {
+                            const float* p = &ln->pts[e * 3];
+                            float* o = e == 0 ? s.a : s.b;
+                            o[0] = p[0]*w[0] + p[1]*w[4] + p[2]*w[8]  + w[12];
+                            o[1] = p[0]*w[1] + p[1]*w[5] + p[2]*w[9]  + w[13];
+                            o[2] = p[0]*w[2] + p[1]*w[6] + p[2]*w[10] + w[14];
+                        }
+                        ghostSamples.push_back(s);
                     }
                 }
             }
@@ -5154,14 +6541,37 @@ void WorldState::DrawWeaponParts(IRenderer* r, const scn::AnimPose& pose, const 
                 std::string texPath = part.scene.dir.empty() ? m.texture : (part.scene.dir + "/" + m.texture);
                 int tex = r->LoadTexture(texPath.c_str());
                 const bool hasUv = nv == m.uv1.size();
+                // The weapon's own effect meshes (taser plasma's "Plane01 as uvani",
+                // "Plan as morph vertexani", blinking glows): their clip loops on the
+                // weapon like map and .seq meshes do - visibility, vertex and UV keys.
+                std::vector<scn::Vec3> fxPos; std::vector<scn::Vec2> fxUv;
+                const scn::Vec2* uvSrc = hasUv ? m.uv1.data() : nullptr;
+                float fxVis = 1.f;
+                if (m.skin.empty() && !m.anims.empty()) {
+                    const uint32_t fxTick = (uint32_t)((double)GetTickCount() * 4.8);
+                    const std::string& fxClip = weaponPose.clipA;
+                    fxVis = (std::max)(0.f, (std::min)(1.f, scn::ModelVisibility(m, fxClip, fxTick, true)));
+                    if (fxVis <= 0.004f) continue;
+                    if (scn::SampleMorphPositions(m, fxClip, fxTick, true, fxPos) && fxPos.size() == nv) verts = fxPos.data();
+                    if (hasUv && scn::SampleMorphUvs(m, fxClip, fxTick, true, fxUv) && fxUv.size() == nv) uvSrc = fxUv.data();
+                }
                 std::vector<float> pu(nv * 5);
                 for (size_t i = 0; i < nv; ++i) {
                     pu[i*5+0]=verts[i].x; pu[i*5+1]=verts[i].y; pu[i*5+2]=verts[i].z;
-                    pu[i*5+3]= hasUv ? m.uv1[i].u : 0.f;  pu[i*5+4]= hasUv ? m.uv1[i].v : 0.f;
+                    pu[i*5+3]= uvSrc ? uvSrc[i].u : 0.f;  pu[i*5+4]= uvSrc ? uvSrc[i].v : 0.f;
                 }
                 std::vector<unsigned short> idx; idx.reserve(m.faces.size() * 3);
                 for (const scn::Face& f : m.faces) { idx.push_back(f.a); idx.push_back(f.b); idx.push_back(f.c); }
-                r->DrawMesh(pu.data(), (int)nv, idx.data(), (int)idx.size(), tex, world, m.renderFlag);
+                // Render states from the material name, as for effect meshes
+                // (alphablend2 = additive glow, alphablend1 = blend, nodepthwrite, nocull).
+                std::string lname = m.name; for (char& c : lname) c = (char)tolower((unsigned char)c);
+                uint32_t flags = m.renderFlag;
+                if (lname.find("alphablend2") != std::string::npos) flags |= 0x40000000u;
+                else if (lname.find("alphablend1") != std::string::npos) flags |= 2u;
+                if (lname.find("nodepthwrite") != std::string::npos) flags |= 64u;
+                r->meshFade = fxVis;
+                r->DrawMesh(pu.data(), (int)nv, idx.data(), (int)idx.size(), tex, world, flags);
+                r->meshFade = 1.f;
             }
         }
         }
@@ -5176,7 +6586,7 @@ void WorldState::OnRender(IRenderer* r) {
     // actorPos + heightoffset; eye = lookAt - forward(yaw,pitch)*depth + right*side.
     // Q free look adds its own yaw/pitch on top (camera only).
     const float viewYaw = camYaw + lookYaw;
-    const float viewPitch = (std::max)(-0.35f, (std::min)(1.2f, camPitch + lookPitch));
+    const float viewPitch = (std::max)(kPitchUp, (std::min)(kPitchDown, camPitch + lookPitch));
     float cp = std::cos(viewPitch);
     float fwd[3]   = { std::sin(viewYaw)*cp, -std::sin(viewPitch), std::cos(viewYaw)*cp };
     float right[3] = { std::cos(viewYaw), 0.f, -std::sin(viewYaw) };
@@ -5192,6 +6602,19 @@ void WorldState::OnRender(IRenderer* r) {
     // the actor sits off to the other side (Z swaps it).
     float at[3]  = { charPos[0] + right[0]*sideOff, charPos[1] + heightOff, charPos[2] + right[2]*sideOff };
     float eye[3] = { at[0] - fwd[0]*camDist, at[1] - fwd[1]*camDist, at[2] - fwd[2]*camDist };
+    // Camera collision: looking up swings the eye down behind the actor, into
+    // the floor. Walk the eye in along its own line until the map is not in
+    // between (kept 25 units off the surface, never closer than 80 to the
+    // look-at point). The shot origin uses the same distance (camDistEff).
+    {
+        const float back[3] = { -fwd[0], -fwd[1], -fwd[2] };
+        float hitT = 0.f, d = camDist;
+        if (RayCollTris(collTris, at, back, camDist, hitT)) d = (std::max)(80.f, hitT - 25.f);
+        // Smooth the pull-in so crossing an edge does not snap the view.
+        camDistEff += (d - camDistEff) * (d < camDistEff ? 1.f : (1.f - std::exp(-lastDt * 1000.f * 0.012f)));
+        if (camDistEff <= 0.f || camDistEff > camDist) camDistEff = d;
+        for (int k = 0; k < 3; ++k) eye[k] = at[k] - fwd[k]*camDistEff;
+    }
     // S10 camera (sub_F48780, ActorCameraNormalFov/ActorCameraFastRunFov):
     // norfov 60 (camera+340), FOV speed 1.75 (camera+348) applied as
     // alpha = dt_ms * 0.01 * 1.75 toward the target each frame - near
@@ -5203,10 +6626,24 @@ void WorldState::OnRender(IRenderer* r) {
     const float fovTarget = fastRun ? 80.f : 60.f;
     const float fovAlpha = 1.f - std::exp(-lastDt * 1000.f * 0.01f * 1.75f);
     curFov += (fovTarget - curFov) * fovAlpha;
+    // Camera shake (SetCameraShake*): a landed hit, or the state's own timed
+    // one (shakePendingAt). Eye and look-at move together, fading out.
+    {
+        const unsigned rnow = GetTickCount();
+        if (shakePendingAt && rnow >= shakePendingAt) { shakeStart = rnow; shakeEnd = rnow + 300; shakeAmp = shakePendingAmp; shakePendingAt = 0; }
+        if (rnow < shakeEnd && shakeAmp > 0.f && shakeEnd > shakeStart) {
+            const float k = 1.f - float(rnow - shakeStart) / float(shakeEnd - shakeStart);
+            const float ox = std::sin(rnow * 0.09f) * shakeAmp * k, oy = std::cos(rnow * 0.11f) * shakeAmp * k * 0.7f;
+            for (float* p : { eye, at }) { p[0] += right[0] * ox; p[1] += oy; p[2] += right[2] * ox; }
+        }
+    }
     r->SetCamera3D(eye, at, curFov, 5.f, 300000.f);
     std::memcpy(camEyeNow, eye, sizeof(camEyeNow)); std::memcpy(camAtNow, at, sizeof(camAtNow));
 
-    for (const scn::Scene& s : map) DrawMapScene(r, s);
+    // A new map: drop the previous map's GPU buffers (built again as drawn).
+    if (mapCacheDirty) { r->ReleaseStaticMeshes(); mapMeshCache.clear(); mapCacheDirty = false; }
+    for (size_t mi = 0; mi < map.size(); ++mi)
+        DrawMapScene(r, map[mi], GetTickCount(), (int)mi == mapSkyIdx ? eye : nullptr, &mapMeshCache);
 
     if (loaded) {
         // curPose is produced each frame by the AnimController (gates + timers + blend).
@@ -5221,31 +6658,60 @@ void WorldState::OnRender(IRenderer* r) {
         if (weaponOk) GatherCharacterPieces(character, weaponWornParts, curPose, pieces, curLowerPoseActive ? &curLowerPose : nullptr);
         DrawCharPieces(r, pieces, place);
         DrawPeers(r);
+        DrawClones(r);
 
         DrawWeaponParts(r, curPose, place, false, curLowerPoseActive ? &curLowerPose : nullptr);
     }
     DrawEffects(r, GetTickCount());
-    // Bullets: a short glowing streak that FLIES from the muzzle to the impact
-    // (12000 units/s), drawn along its velocity (renderType 1, like the .seq
-    // streaks) - not one long line, which perspective showed slanted.
+    // Memory: what the current map, outfit and weapons no longer draw is let go
+    // (textures unused for 30 s - reloaded by name if drawn again; the looks and
+    // weapons of players no longer here).
+    {
+        static unsigned nextTrim = 0;
+        const unsigned now = GetTickCount();
+        if (now >= nextTrim) {
+            nextTrim = now + 10000;
+            r->TrimTextures(30000);
+            std::set<std::string> lookKeys, weaponKeys;
+            if (mpClient.Connected())
+                for (auto& kv : mpClient.Peers()) { lookKeys.insert(kv.second.equip); weaponKeys.insert(kv.second.weapon + "|" + kv.second.weaponStates); }
+            for (auto it = peerLooks.begin(); it != peerLooks.end(); ) it = lookKeys.count(it->first) ? std::next(it) : peerLooks.erase(it);
+            for (auto it = peerWeapons.begin(); it != peerWeapons.end(); ) it = weaponKeys.count(it->first) ? std::next(it) : peerWeapons.erase(it);
+            static unsigned nextMemLog = 0;
+            if (now >= nextMemLog) { nextMemLog = now + 60000; crash::LogMemory("periodic"); }
+        }
+    }
+    DrawGhostTrail(r, GetTickCount());
+    // Bullets of guns without a beam sequence (see below).
     {
         const unsigned now = GetTickCount();
-        const float speed = 12.f, streak = 140.f;   // units per ms, streak length
-        std::vector<float> buf;
+        // Bullets of guns without a tracer .seq (beta CGunTracerNode, sub_730730 /
+        // sub_730320 / sub_730530): a white quad, width 4, alpha 0.75, no
+        // texture, from the muzzle (10% down the shot) to the target, on for
+        // 100 ms; every frame its tail is pulled toward the target by (1 - t^2)
+        // of what is left (t = age / 100 ms), so the line collapses on the
+        // impact - a short white stub near the target, not a laser. The
+        // per-frame product is evaluated at 60 steps/s (as at the client's
+        // usual frame rate).
+        const float kLifeMs = 100.f, kStepMs = 1000.f / 60.f;
         gunTracers.erase(std::remove_if(gunTracers.begin(), gunTracers.end(), [&](const GunTracer& g) {
-            const float d[3] = { g.b[0]-g.a[0], g.b[1]-g.a[1], g.b[2]-g.a[2] };
-            const float len = std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
-            const float head = speed * (float)(now - g.born);
-            if (len < 1.f || head - streak > len) return true;   // reached the impact
-            const float h = (std::min)(head, len), t0 = (std::max)(0.f, head - streak);
-            const float mid = (h + t0) * 0.5f / len, seg = h - t0;
-            const float p[12] = { g.a[0] + d[0]*mid, g.a[1] + d[1]*mid, g.a[2] + d[2]*mid,
-                                  1.f, 0.95f, 0.7f, 1.f, 6.f, seg, d[0]/len*seg, d[1]/len*seg, d[2]/len*seg };
-            buf.insert(buf.end(), p, p + 12);
-            return false;
+            return (float)(now - g.born) >= kLifeMs;
         }), gunTracers.end());
-        int streakTex = r->LoadTexture("resources/resources/effects/steak03.dds");
-        if (!buf.empty()) r->DrawParticles(buf.data(), (int)(buf.size() / 12), streakTex, true, 2);
+        for (const GunTracer& g : gunTracers) {
+            const float age = (float)(now - g.born);
+            float left = 1.f;
+            for (float tk = kStepMs; tk <= age; tk += kStepMs) { const float x = tk / kLifeMs; left *= (1.f - x * x); }
+            float start[3], tail[3];
+            // The client starts 10% down the shot; at a far target that is
+            // hundreds of units off the gun, so cap it to a short fixed lead.
+            const float dl[3] = { g.b[0]-g.a[0], g.b[1]-g.a[1], g.b[2]-g.a[2] };
+            const float shotLen = std::sqrt(dl[0]*dl[0] + dl[1]*dl[1] + dl[2]*dl[2]);
+            const float lead = shotLen > 1.f ? (std::min)(0.1f, 25.f / shotLen) : 0.f;
+            for (int k = 0; k < 3; ++k) start[k] = g.a[k] + dl[k] * lead;
+            for (int k = 0; k < 3; ++k) tail[k] = g.b[k] - (g.b[k] - start[k]) * left;
+            const float seg[6] = { tail[0], tail[1], tail[2], g.b[0], g.b[1], g.b[2] };
+            r->DrawBeam(seg, 2, 4.f, 0xBFFFFFFF, -1, false, 0.f, 1.f);
+        }
         // Tracer beams (CLightningNode, S1 sub_63C780/sub_63C930): UnitCount+2
         // points from the gun's fire node to the hit; on while the node is
         // active (begin..end), fading in over FadeIn and out over FadeOut ms;
@@ -5272,7 +6738,7 @@ void WorldState::OnRender(IRenderer* r) {
                     const float u0 = (float)age * bn.beam.uvAnimSpeed / 1000.f;
                     const int tex = r->LoadTexture(bn.beam.texture.c_str());
                     const uint32_t alpha = (uint32_t)(a * 255.f);
-                    r->DrawBeam(pts.data(), n, (float)(std::max)(1u, bn.beam.unitWidth), (alpha << 24) | 0xFFFFFF, tex,
+                    r->DrawBeam(pts.data(), n, (float)(std::max)(1u, bn.beam.unitWidth), (alpha << 24) | bn.rgb, tex,
                                 bn.beam.blendType == 1, u0, u0 + bn.beam.uvScale);
                 }
             }
@@ -5303,7 +6769,7 @@ void WorldState::OnRender(IRenderer* r) {
                 }
                 const float u0 = (float)age * bn.beam.uvAnimSpeed / 1000.f;
                 const int tex = r->LoadTexture(bn.beam.texture.c_str());
-                r->DrawBeam(pts.data(), n, (float)(std::max)(1u, bn.beam.unitWidth), ((uint32_t)(a * 255.f) << 24) | 0xFFFFFF, tex,
+                r->DrawBeam(pts.data(), n, (float)(std::max)(1u, bn.beam.unitWidth), ((uint32_t)(a * 255.f) << 24) | bn.rgb, tex,
                             bn.beam.blendType == 1, u0, u0 + bn.beam.uvScale);
             }
         }
@@ -5349,7 +6815,6 @@ void WorldState::OnRender(IRenderer* r) {
         r->DrawRect(bx, by, (int)(bw * f), bh, flash ? 0xFFFFFFFF : (f > 0.5f ? 0xFF3CC85A : f > 0.25f ? 0xFFE0B030 : 0xFFE03030));
         r->DrawText(bx, by - 1, bw, bh + 2, ("HP " + std::to_string((int)std::ceil((std::max)(0.f, myHp))) + " / " + std::to_string((int)myHpMax)).c_str(), 13, 0xFFFFFFFF, 1);
     }
-    r->DrawText(10, 10, 940, 24, "WASD move | Space jump | Mouse attack | Q look around | Up/Down zoom | ESC menu | F4 inventory | F1 bone editor", 15, 0xFFFFFFFF);
     if (loaded && weaponOk) {
         // The weapon's own crosshair (crosshair_file -> image/weapon/<name>_1.png)
         // at the screen centre (HudLayout), scaled from 1024x768.
@@ -5357,7 +6822,7 @@ void WorldState::OnRender(IRenderer* r) {
         const float sy = (float)r->height / 768.f, sx = (float)r->width / 1024.f;
         const int cx = (int)(hud.xhairCx * sx), cy = (int)(hud.xhairCy * sy);
         int xt = -1;
-        if (!weaponCrosshair.empty()) xt = r->LoadTexture(("resources/resources/image/weapon/" + weaponCrosshair + "_1.png").c_str());
+        if (!weaponCrosshair.empty()) xt = r->LoadTexture((RES("resources/resources/image/weapon/") + weaponCrosshair + "_1.png").c_str());
         if (xt >= 0) {
             // 64x64 layout units (the 128 png at half size): measured against the
             // original, the crosshair spans ~0.77 of the arc's radius.
@@ -5375,7 +6840,7 @@ void WorldState::OnRender(IRenderer* r) {
             const int aw = (int)((hud.arcR - hud.arcL) * sy), ah = (int)((hud.arcB - hud.arcT) * sy);
             auto img = [&](const std::string& tex) {
                 if (tex.empty()) return;
-                const int t = r->LoadTexture(("resources/resources/gui/new/" + tex).c_str());
+                const int t = r->LoadTexture((RES("resources/resources/gui/new/") + tex).c_str());
                 if (t >= 0) r->DrawImage(al, at, aw, ah, t, 0, 0, 1, 1);
             };
             img(hud.empty);
@@ -5395,23 +6860,31 @@ void WorldState::OnRender(IRenderer* r) {
         const std::string ammo = gunReloading ? std::string("Reloading...") : std::to_string(gunAmmo) + " / " + std::to_string(gunMag) + "   (R reload)";
         r->DrawText(r->width - 330, r->height - 44, 320, 30, ammo.c_str(), 22, (gunAmmo > 0 || gunReloading) ? 0xFFFFFFFF : 0xFFFF6060);
     }
-    if (weaponOk) {
+    if (weaponOk && boneEditMode) {   // the bone editor's own line (F1)
         const std::string mount = weaponParts.empty() ? weaponBone :
             (weaponParts[0].idleBoneOverride.empty() ? weaponParts[0].attackBone : weaponParts[0].idleBoneOverride);
         const std::string help = boneEditMode
             ? " [EDITING: L/R primary, Shift+L/R secondary, Backspace reset, Ctrl+Shift+S save, F1 exit]"
             : " [F1 edit bones]";
-        r->DrawText(10, 54, 1200, 24, ("Weapon: " + weaponStates + " mount=" + mount + help).c_str(), 14, 0xFFB0E0FF);
+        r->DrawText(10, 32, 1200, 24, ("Weapon: " + weaponStates + " mount=" + mount + help).c_str(), 14, 0xFFB0E0FF);
     }
     int fps = lastDt > 1e-5f ? (int)(1.f / lastDt) : 0;
-    r->DrawText(10, 32, 400, 24, ("FPS: " + std::to_string(fps) + "  (F2 = cap 60/144/off)").c_str(), 15, 0xFF66FF66);
-    if (mapIdx >= 0 && mapIdx < (int)maps.size() && !maps[mapIdx].bgm.empty()) {
-        const auto& tracks = maps[mapIdx].bgm;
-        const std::string title = Basename(tracks[bgmIndex]);
+    if (weaponOk && weaponHolstered)
+        r->DrawText(10, 56, 600, 20, ("Holster roll: " + std::to_string((gHolsterRoll45 - 4) * 45) + " deg   ( [ and ] turn the grip side )").c_str(), 14, 0xFFFFCC66);
+    r->DrawText(10, 10, 400, 24, ("FPS: " + std::to_string(fps) + "  (F2 = cap 60/144/off)").c_str(), 15, 0xFF66FF66);
+    {   // music box (off by default; ESC > Settings, F5, F6)
         const int x = (std::max)(10, r->width - 420);
         r->DrawRect(x, 58, 410, 48, 0xB0101824);
-        r->DrawText(x + 10, 62, 390, 20, ("BGM " + std::to_string(bgmIndex + 1) + "/" + std::to_string(tracks.size()) + ": " + title).c_str(), 14, 0xFFFFFFFF);
-        r->DrawText(x + 10, 82, 390, 20, audio::MusicPaused() ? "F5 Play | F6 Next | Shift+F6 Prev | F7 Sex" : "F5 Pause | F6 Next | Shift+F6 Prev | F7 Sex", 13, 0xFF80D8FF);
+        if (!gMusicOn) {
+            r->DrawText(x + 10, 62, 390, 20, "Music: off", 14, 0xFFFFFFFF);
+            r->DrawText(x + 10, 82, 390, 20, "F5 on | F6 choose track | ESC > Settings | F7 Sex", 13, 0xFF80D8FF);
+        } else {
+            std::string title = gMusicTrack;
+            if (title.empty() && mapIdx >= 0 && mapIdx < (int)maps.size() && bgmIndex >= 0 && bgmIndex < (int)maps[mapIdx].bgm.size())
+                title = maps[mapIdx].bgm[bgmIndex];
+            r->DrawText(x + 10, 62, 390, 20, ("Music: " + Basename(title)).c_str(), 14, 0xFFFFFFFF);
+            r->DrawText(x + 10, 82, 390, 20, "F5 off | F6 Next | Shift+F6 Prev | F7 Sex", 13, 0xFF80D8FF);
+        }
     }
 
     // Centered aim crosshair (replaces the hidden Windows cursor) - only
@@ -5626,7 +7099,7 @@ void WorldState::OnRender(IRenderer* r) {
 
     // ESC > Settings.
     if (mapMenu && menuPage == 3) {
-        const int rows = 5, W = 560, H = rows * 34 + 80;
+        const int rows = 7, W = 560, H = rows * 34 + 80;
         const int x = (r->width - W) / 2, y = (r->height - H) / 2;
         r->DrawRect(x, y, W, H, 0xE00A121C);
         r->DrawRect(x, y, W, 26, 0xFF1C4A6E);
@@ -5638,6 +7111,8 @@ void WorldState::OnRender(IRenderer* r) {
             "Resolution:   < " + res + " >",
             std::string("Display:   < ") + (gBorderless ? "Borderless fullscreen" : "Windowed") + " >",
             std::string("Graphics:   < ") + (gGraphicsQuality == 0 ? "Low" : gGraphicsQuality == 1 ? "Medium" : "High") + " >",
+            std::string("Music:   < ") + (gMusicOn ? "On" : "Off") + " >",
+            "Track:   < " + (gMusicTrack.empty() ? std::string("map playlist") : Basename(gMusicTrack)) + " >",
             "Back" };
         for (int i = 0; i < rows; ++i) {
             const int ry = y + 44 + i * 34;

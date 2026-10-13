@@ -1,4 +1,5 @@
 #include "lua_weapon_fire.h"
+#include "lua_script_scan.h"
 #include "../app/dbg.h"
 
 extern "C" {
@@ -14,6 +15,9 @@ extern "C" {
 #include <set>
 
 namespace luaw {
+
+static float g_weaponRange = 0.f;
+void SetWeaponRange(float range) { g_weaponRange = range; }
 
 // Lee un archivo entero a un string (latin1/binario, igual que fs.readFileSync('latin1') del
 // motor JS - los scripts traen coreano CP949 en comentarios, no hace falta decodificarlo bien
@@ -41,6 +45,15 @@ static bool RunString(lua_State* L, const std::string& src, const char* chunkNam
 // a InitAttack1 (nunca los comparan/suman - verificado). Se definen como su propio nombre en
 // string: alcanza para re-vincularlos por NOMBRE contra attackattribindexer.lua despues.
 static std::string ConstantsShimSrc(const std::string& scriptDir) {
+    for (const char* nm : { "/ActorStates_Constants.lua", "/actorstates_constants.lua" }) {
+        const std::string f = scriptDir + nm;
+        if (!IsBytecodeFile(f)) continue;
+        // Compiled script: every numeric constant is its own name (the
+        // booleans LOOP_TRUE... stay what they are).
+        std::string out;
+        for (const auto& kv : ConstantsOf(f)) { out += kv.first; out += " = \""; out += kv.first; out += "\"\n"; }
+        return out;
+    }
     std::string text;
     if (!ReadFile(scriptDir + "/ActorStates_Constants.lua", text)) {
         if (!ReadFile(scriptDir + "/actorstates_constants.lua", text)) return "";
@@ -103,6 +116,9 @@ static AttackShape ReadShape(lua_State* L) {
         s.width  = ReadField(L, "width", 0);
         s.height = ReadField(L, "height", 0);
         s.angle  = ReadField(L, "angle", 0);
+        // MAKEFAN's direction is a MAKEVECTOR2 (x, z on the ground): (0,-1) = forward.
+        if (s.kind == "fan" && s.dirZ == 0.f) { s.dirZ = s.dirY; s.dirY = 0.f; }
+        if (s.kind == "thickray") s.radius = ReadField(L, "thickness", 0);
     }
     lua_pop(L, 1);
     return s;
@@ -157,6 +173,10 @@ std::vector<WeaponAttack> RunWeaponFire(const char* scriptDirC, const char* shim
         ok = false;
     }
 
+    if (ok && g_weaponRange > 0.f) {
+        char buf[96]; snprintf(buf, sizeof buf, "WEAPON.GetRange = function(self) return %.3f end", g_weaponRange);
+        RunString(L, buf, "range");
+    }
     std::string weaponSrc;
     if (ok && ReadFile(scriptDir + "/" + luaFile, weaponSrc)) {
         ok = RunString(L, weaponSrc, luaFile);
@@ -205,6 +225,19 @@ std::vector<WeaponAttack> RunWeaponFire(const char* scriptDirC, const char* shim
                         lua_pop(L, 1);
                         outState->hitStopA            = ReadField(L, "hitStopA", 0.f);
                         outState->hitStopB            = ReadField(L, "hitStopB", 0.f);
+                        auto readList = [&](const char* k, std::vector<float>& v) {
+                            lua_getfield(L, -1, k);
+                            if (lua_istable(L, -1))
+                                for (int i = 1, n = (int)lua_objlen(L, -1); i <= n; ++i) {
+                                    lua_rawgeti(L, -1, i);
+                                    v.push_back(lua_isboolean(L, -1) ? float(lua_toboolean(L, -1)) : float(lua_tonumber(L, -1)));
+                                    lua_pop(L, 1);
+                                }
+                            lua_pop(L, 1);
+                        };
+                        readList("cameraShake", outState->cameraShake);
+                        readList("cameraShakeFactor1", outState->cameraShakeF1);
+                        readList("cameraShakeFactor2", outState->cameraShakeF2);
                         lua_getfield(L, -1, "stealthCancel");
                         outState->stealthCancel = lua_toboolean(L, -1) != 0;
                         lua_pop(L, 1);
@@ -258,6 +291,47 @@ std::vector<WeaponAttack> RunWeaponFire(const char* scriptDirC, const char* shim
                                     lua_pop(L, 1);
                                 }
                             }
+                            lua_pop(L, 1);
+                            // Pairs/quads of blow and stun conditions; flags; shake; DependOn.
+                            auto readTuples = [&](const char* k, int width, std::vector<float>& v) {
+                                lua_getfield(L, -1, k);
+                                if (lua_istable(L, -1))
+                                    for (int q = 1, qn = (int)lua_objlen(L, -1); q <= qn; ++q) {
+                                        lua_rawgeti(L, -1, q);
+                                        if (lua_istable(L, -1))
+                                            for (int f = 1; f <= width; ++f) { lua_rawgeti(L, -1, f); v.push_back((float)lua_tonumber(L, -1)); lua_pop(L, 1); }
+                                        lua_pop(L, 1);
+                                    }
+                                lua_pop(L, 1);
+                            };
+                            readTuples("blow", 2, a.blow);
+                            readTuples("upperCut", 2, a.upperCut);
+                            readTuples("stun", 4, a.stun);
+                            auto readArgs = [&](const char* k, std::vector<float>& v) {
+                                lua_getfield(L, -1, k);
+                                if (lua_istable(L, -1))
+                                    for (int q = 1, qn = (int)lua_objlen(L, -1); q <= qn; ++q) {
+                                        lua_rawgeti(L, -1, q);
+                                        v.push_back(lua_isboolean(L, -1) ? float(lua_toboolean(L, -1)) : float(lua_tonumber(L, -1)));
+                                        lua_pop(L, 1);
+                                    }
+                                lua_pop(L, 1);
+                            };
+                            std::vector<float> en; readArgs("shakeEnable", en);
+                            a.shakeEnable = !en.empty() && en[0] != 0.f;
+                            readArgs("shakeF1", a.shakeF1); readArgs("shakeF2", a.shakeF2);
+                            // rawget: the shim's lenient __index hands back a no-op
+                            // FUNCTION for unset fields, which reads as true.
+                            auto rawBool = [&](const char* k) {
+                                lua_pushstring(L, k); lua_rawget(L, -2);
+                                const bool v = lua_isboolean(L, -1) ? lua_toboolean(L, -1) != 0 : (lua_isnumber(L, -1) && lua_tonumber(L, -1) != 0);
+                                lua_pop(L, 1); return v;
+                            };
+                            a.shakeWhenSuccess = rawBool("shakeWhenSuccess");
+                            a.alwaysCritical = rawBool("alwaysCritical");
+                            a.successCondition = ReadStrField(L, "attackSuccessCondition");
+                            lua_getfield(L, -1, "dependOn");
+                            if (lua_istable(L, -1)) { lua_getfield(L, -1, "listIndex"); if (lua_isnumber(L, -1)) a.dependOn = (int)lua_tonumber(L, -1) - 1; lua_pop(L, 1); }
                             lua_pop(L, 1);
                             lua_getfield(L, -1, "offsets");
                             if (lua_istable(L, -1)) {

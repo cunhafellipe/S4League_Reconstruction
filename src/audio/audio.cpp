@@ -1,5 +1,7 @@
 #include "audio/audio.h"
 #include "app/dbg.h"
+#include "app/respath.h"
+#include "app/reslog.h"
 #include <windows.h>
 #include <xaudio2.h>
 #include <algorithm>
@@ -11,7 +13,7 @@
 #include "../../third_party/stb_vorbis.c"
 
 namespace audio {
-struct Clip { WAVEFORMATEX format = {}; std::vector<BYTE> pcm; };
+struct Clip { WAVEFORMATEX format = {}; std::vector<BYTE> pcm; DWORD lastUse = 0; reslog::Tag memTag; };
 struct Playing { IXAudio2SourceVoice* voice = nullptr; std::shared_ptr<Clip> clip; bool music = false; };
 struct Pending { std::string path; float volume; DWORD due; };
 
@@ -26,18 +28,20 @@ static bool g_musicPaused = false, g_musicFinished = false, g_comInit = false;
 static std::string LocalPath(std::string path) {
     std::replace(path.begin(), path.end(), '\\', '/');
     if (path.rfind("Resources/", 0) == 0 || path.rfind("resources/", 0) == 0)
-        path = "resources/" + path;
+        path = RES("resources/") + path;
     // Some data drops the "Resources/" prefix (bginfo [BGM] "Bgm/battle1.ogg",
     // weapon Lua "Sound/..."): those live under resources/resources/ too.
     else if (path.find(':') == std::string::npos && path.rfind("/", 0) != 0)
-        path = "resources/resources/" + path;
+        path = RES("resources/resources/") + path;
     return path;
 }
 
-static std::shared_ptr<Clip> Decode(const std::string& requested) {
+// Effects stay decoded for reuse (dropped after 60 s unplayed, see Pump);
+// music is decoded per play and freed when it stops.
+static std::shared_ptr<Clip> Decode(const std::string& requested, bool cache) {
     const std::string path = LocalPath(requested);
     auto found = g_cache.find(path);
-    if (found != g_cache.end()) return found->second;
+    if (found != g_cache.end()) { found->second->lastUse = GetTickCount(); return found->second; }
 
     int channels = 0, sampleRate = 0;
     short* pcm = nullptr;
@@ -57,14 +61,16 @@ static std::shared_ptr<Clip> Decode(const std::string& requested) {
     const size_t bytes = (size_t)samples * channels * sizeof(short);
     clip->pcm.assign(reinterpret_cast<BYTE*>(pcm), reinterpret_cast<BYTE*>(pcm) + bytes);
     std::free(pcm);
-    g_cache[path] = clip;
+    clip->lastUse = GetTickCount();
+    clip->memTag.Set(reslog::SOUND, path, clip->pcm.size(), cache ? "(effect)" : "(music)");
+    if (cache) g_cache[path] = clip;
     DbgLog("[audio] decoded '%s' bytes=%zu", path.c_str(), clip->pcm.size());
     return clip;
 }
 
 static IXAudio2SourceVoice* Start(const std::string& path, float volume, bool music) {
     if (!g_xaudio) return nullptr;
-    auto clip = Decode(path);
+    auto clip = Decode(path, !music);
     if (!clip) return nullptr;
     IXAudio2SourceVoice* voice = nullptr;
     if (FAILED(g_xaudio->CreateSourceVoice(&voice, &clip->format))) return nullptr;
@@ -113,6 +119,13 @@ void Pump() {
         if (g_playing[i].music && g_playing[i].voice == g_music) { g_music = nullptr; g_musicFinished = true; }
         g_playing[i].voice->DestroyVoice();
         g_playing.erase(g_playing.begin() + i);
+    }
+    // Effects not played for 60 s are let go (decoded again when next played).
+    static DWORD nextTrim = 0;
+    if (now >= nextTrim) {
+        nextTrim = now + 5000;
+        for (auto it = g_cache.begin(); it != g_cache.end(); )
+            it = (it->second.use_count() == 1 && now - it->second->lastUse > 60000) ? g_cache.erase(it) : std::next(it);
     }
 }
 

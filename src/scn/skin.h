@@ -43,6 +43,13 @@ Mat4 SampleNode(const Model& m, uint32_t tick);
 // A model's visibility (opacity) track at tick: the clip's own anim, else the
 // model's only anim; 1 when it has no visibility keys.
 float ModelVisibility(const Model& m, const std::string& clipName, uint32_t tick, bool loop);
+// Vertex animation ("as morph vertexani" effect meshes): the model's vertex
+// positions at `tick` - each listed vertex interpolated between the keys that
+// name it (bind pose before its first key, held after its last). Returns false
+// (out untouched) when the model has no morph keys.
+bool SampleMorphPositions(const Model& m, const std::string& clipName, uint32_t tick, bool loop, std::vector<Vec3>& out);
+// Same for the [idx,u,v] keys ("as uvani": scrolling water, screens): uv1 at tick.
+bool SampleMorphUvs(const Model& m, const std::string& clipName, uint32_t tick, bool loop, std::vector<Vec2>& out);
 // Same, writing into a caller-owned float[16] (legacy call shape).
 void SampleNode(const Model& m, uint32_t tick, float out16[16]);
 

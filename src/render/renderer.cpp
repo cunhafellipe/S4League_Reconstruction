@@ -10,9 +10,17 @@
 
 #include "renderer.h"
 #include "app/dbg.h"
+#include "app/respath.h"
+#include "app/reslog.h"
 #include <d3d9.h>
+#include <wincodec.h>
+#include <vector>
+#include <string>
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 #include <filesystem>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 
@@ -34,7 +42,6 @@ static void EnsureD3DX() {
 
 // Texture root (relative to the exe's working dir). Whole resources tree so
 // intro (resources/intro), loading, and xui/image all resolve by filename.
-static const char* kTexRoot = "resources/resources";
 
 // FUN_01c84ac0 : fill D3DPRESENT_PARAMETERS from the renderer fields.
 static void BuildPresentParams(const CRendererD3D& r, D3DPRESENT_PARAMETERS& pp)
@@ -158,7 +165,57 @@ void CRendererD3D::Present()
 {
     if (!device) return;
     device->EndScene();
+    if (screenshotPending) { screenshotPending = false; SaveScreenshot(); }
     device->Present(nullptr, nullptr, nullptr, nullptr);
+}
+
+// The back buffer (resolved first: it may be multisampled) copied to system
+// memory and written as a PNG through WIC into screenshots/.
+void CRendererD3D::SaveScreenshot()
+{
+    IDirect3DSurface9* back = nullptr;
+    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))) return;
+    D3DSURFACE_DESC d; back->GetDesc(&d);
+    IDirect3DSurface9 *resolved = nullptr, *sys = nullptr;
+    bool ok = SUCCEEDED(device->CreateRenderTarget(d.Width, d.Height, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &resolved, nullptr)) &&
+              SUCCEEDED(device->StretchRect(back, nullptr, resolved, nullptr, D3DTEXF_NONE)) &&
+              SUCCEEDED(device->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr)) &&
+              SUCCEEDED(device->GetRenderTargetData(resolved, sys));
+    std::string path;
+    D3DLOCKED_RECT lr;
+    if (ok && (d.Format == D3DFMT_X8R8G8B8 || d.Format == D3DFMT_A8R8G8B8) && SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+        std::vector<BYTE> px((size_t)d.Width * d.Height * 4);
+        for (UINT y = 0; y < d.Height; ++y) {
+            const BYTE* src = (const BYTE*)lr.pBits + (size_t)y * lr.Pitch;
+            BYTE* dst = px.data() + (size_t)y * d.Width * 4;
+            memcpy(dst, src, d.Width * 4);
+            for (UINT x = 0; x < d.Width; ++x) dst[x * 4 + 3] = 255;
+        }
+        sys->UnlockRect();
+        CreateDirectoryA("screenshots", nullptr);
+        SYSTEMTIME t; GetLocalTime(&t);
+        char name[96];
+        snprintf(name, sizeof(name), "screenshots/S4_%04d-%02d-%02d_%02d-%02d-%02d_%03d.png",
+                 t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+        path = name;
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        IWICImagingFactory* wic = nullptr; IWICStream* st = nullptr; IWICBitmapEncoder* enc = nullptr;
+        IWICBitmapFrameEncode* fr = nullptr; IPropertyBag2* props = nullptr;
+        wchar_t wname[96]; MultiByteToWideChar(CP_ACP, 0, name, -1, wname, 96);
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+        ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+             SUCCEEDED(wic->CreateStream(&st)) && SUCCEEDED(st->InitializeFromFilename(wname, GENERIC_WRITE)) &&
+             SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+             SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) &&
+             SUCCEEDED(enc->CreateNewFrame(&fr, &props)) && SUCCEEDED(fr->Initialize(props)) &&
+             SUCCEEDED(fr->SetSize(d.Width, d.Height)) && SUCCEEDED(fr->SetPixelFormat(&fmt)) &&
+             SUCCEEDED(fr->WritePixels(d.Height, d.Width * 4, (UINT)px.size(), px.data())) &&
+             SUCCEEDED(fr->Commit()) && SUCCEEDED(enc->Commit());
+        if (props) props->Release(); if (fr) fr->Release(); if (enc) enc->Release(); if (st) st->Release(); if (wic) wic->Release();
+        if (SUCCEEDED(co)) CoUninitialize();
+    } else ok = false;
+    if (sys) sys->Release(); if (resolved) resolved->Release(); back->Release();
+    DbgLog("[screenshot] %s %s (%ux%u fmt=%d)", ok ? "saved" : "FAILED", path.c_str(), d.Width, d.Height, (int)d.Format);
 }
 
 // --- Text via ID3DXFont (D3DXCreateFontA from the game's d3dx9_29.dll) -------
@@ -201,7 +258,8 @@ ID3DXFont* CRendererD3D::GetFont(int px) {
     if (it != fonts.end()) return it->second;
     if (!fontInit) {
         fontInit = true;
-        const char* ttf = "resources/resources/gui/2002.ttf";
+        const std::string ttfPath = RES("resources/resources/gui/2002.ttf");
+        const char* ttf = ttfPath.c_str();
         AddFontResourceExA(ttf, FR_PRIVATE, nullptr);
         fontFamily = GetTtfFamily(ttf);
         HMODULE m = GetModuleHandleA("d3dx9_29.dll");
@@ -253,7 +311,7 @@ void CRendererD3D::DrawTriangles(const float* posUV, int vc,
     device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
     device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-    device->SetTexture(0, textures[tex]);
+    device->SetTexture(0, Tex(tex));
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
     device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vc, ic / 3,
                                    idx, D3DFMT_INDEX16, v.data(), sizeof(TLT));
@@ -411,7 +469,7 @@ void CRendererD3D::DrawParticles(const float* particles, int count, int tex, boo
     device->SetRenderState(D3DRS_DESTBLEND, additive ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
     bool textured = (tex >= 0 && tex < (int)textures.size());
     if (textured) {
-        device->SetTexture(0, textures[tex]);
+        device->SetTexture(0, Tex(tex));
         device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
         device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
         device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
@@ -475,7 +533,7 @@ void CRendererD3D::DrawBeam(const float* pts, int count, float width, uint32_t a
     device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
     device->SetRenderState(D3DRS_DESTBLEND, additive ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
     const bool textured = (tex >= 0 && tex < (int)textures.size());
-    device->SetTexture(0, textured ? textures[tex] : nullptr);
+    device->SetTexture(0, textured ? Tex(tex) : nullptr);
     device->SetTextureStageState(0, D3DTSS_COLOROP, textured ? D3DTOP_MODULATE : D3DTOP_SELECTARG2);
     device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
@@ -500,12 +558,25 @@ void CRendererD3D::DrawBeam(const float* pts, int count, float width, uint32_t a
 void CRendererD3D::DrawMesh(const float* posUV, int vc,
                             const unsigned short* idx, int ic, int tex,
                             const float* world16, uint32_t flags) {
+    if (meshCapture && vc > 0 && ic > 0) {
+        CapturedMesh c;
+        c.verts.assign(posUV, posUV + (size_t)vc * 5); c.vertCount = vc;
+        c.idx.assign(idx, idx + ic); c.tex = tex; c.flags = flags;
+        if (world16) std::memcpy(c.world, world16, sizeof(c.world));
+        else { c.world[0] = c.world[5] = c.world[10] = c.world[15] = 1.f; }
+        meshCapture->push_back(std::move(c));
+        return;
+    }
     if (!device || vc <= 0 || ic <= 0) return;
-    struct V3T { float x, y, z, u, v; };
-    std::vector<V3T> v(vc);
-    for (int i = 0; i < vc; ++i)
-        v[i] = { posUV[i*5], posUV[i*5+1], posUV[i*5+2], posUV[i*5+3], posUV[i*5+4] };
+    // posUV is already xyz uv per vertex: sent as is (no repack).
+    BeginMeshStates(tex, world16, flags);
+    device->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+    device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vc, ic / 3,
+                                   idx, D3DFMT_INDEX16, posUV, sizeof(float) * 5);
+    EndMeshStates();
+}
 
+void CRendererD3D::BeginMeshStates(int tex, const float* world16, uint32_t flags) {
     D3DMATRIX world;
     if (world16) std::memcpy(&world, world16, sizeof(world));
     else { world = {}; world._11 = world._22 = world._33 = world._44 = 1.0f; }
@@ -521,7 +592,7 @@ void CRendererD3D::DrawMesh(const float* posUV, int vc,
     const bool noZWrite    = (flags & 64) != 0;
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);      // winding unconfirmed -> no cull
     device->SetRenderState(D3DRS_LIGHTING, FALSE);             // unlit textured (S4 characters)
-    device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZENABLE, (flags & 0x20000000u) ? FALSE : TRUE);   // runtime: the sky pass (2048 in files = nomipmap)
     device->SetRenderState(D3DRS_ZWRITEENABLE, (transparent || noZWrite) ? FALSE : TRUE);
     bool textured = (tex >= 0 && tex < (int)textures.size());
     if (textured) {
@@ -552,7 +623,7 @@ void CRendererD3D::DrawMesh(const float* posUV, int vc,
             device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
         }
         ApplyMeshSampler(0);   // quality: trilinear / anisotropic
-        device->SetTexture(0, textures[tex]);
+        device->SetTexture(0, Tex(tex));
     } else {
         // No texture -> flat color so the geometry (skinning) is visible.
         device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
@@ -564,9 +635,9 @@ void CRendererD3D::DrawMesh(const float* posUV, int vc,
         device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
         device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
     }
-    device->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
-    device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vc, ic / 3,
-                                   idx, D3DFMT_INDEX16, v.data(), sizeof(V3T));
+}
+
+void CRendererD3D::EndMeshStates() {
     device->SetRenderState(D3DRS_ZENABLE, FALSE);             // restore 2D-friendly state
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
@@ -585,11 +656,14 @@ void CRendererD3D::DrawMeshLightmap(const float* posUV2, int vc,
         DrawMesh(p5.data(), vc, idx, ic, tex, world16, flags);
         return;
     }
-    struct V { float x,y,z,u1,v1,u2,v2; };
-    std::vector<V> v(vc);
-    for (int i = 0; i < vc; ++i) { const float* s = posUV2 + i*7;
-        v[i] = { s[0],s[1],s[2], s[3],s[4], s[5],s[6] }; }
+    BeginLightmapStates(tex, lmTex, world16, flags);
+    device->SetFVF(D3DFVF_XYZ | D3DFVF_TEX2);
+    device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vc, ic / 3,
+                                   idx, D3DFMT_INDEX16, posUV2, sizeof(float) * 7);
+    EndLightmapStates();
+}
 
+void CRendererD3D::BeginLightmapStates(int tex, int lmTex, const float* world16, uint32_t flags) {
     D3DMATRIX world;
     if (world16) std::memcpy(&world, world16, sizeof(world));
     else { world = {}; world._11=world._22=world._33=world._44=1.0f; }
@@ -598,21 +672,21 @@ void CRendererD3D::DrawMeshLightmap(const float* posUV2, int vc,
     const bool cutout = (flags & 4) != 0;
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     device->SetRenderState(D3DRS_LIGHTING, FALSE);
-    device->SetRenderState(D3DRS_ZENABLE, TRUE);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZENABLE, (flags & 0x20000000u) ? FALSE : TRUE);   // runtime: the sky pass
+    device->SetRenderState(D3DRS_ZWRITEENABLE, (flags & 64) ? FALSE : TRUE);
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, cutout ? TRUE : FALSE);
     device->SetRenderState(D3DRS_ALPHAREF, 128);
     device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
     // Stage 0: main texture on UV set 0.
-    device->SetTexture(0, textures[tex]);
+    device->SetTexture(0, Tex(tex));
     device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
     device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
     device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
     device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
     // Stage 1: lightmap on UV set 1, MODULATE2X (baked lighting keeps brightness).
-    device->SetTexture(1, textures[lmTex]);
+    device->SetTexture(1, Tex(lmTex));
     device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 1);
     device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
     device->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
@@ -621,16 +695,64 @@ void CRendererD3D::DrawMeshLightmap(const float* posUV2, int vc,
     device->SetTextureStageState(1, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
     ApplyMeshSampler(0);
     ApplyMeshSampler(1);
+}
 
-    device->SetFVF(D3DFVF_XYZ | D3DFVF_TEX2);
-    device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vc, ic / 3,
-                                   idx, D3DFMT_INDEX16, v.data(), sizeof(V));
+void CRendererD3D::EndLightmapStates() {
     // Disable stage 1 so following single-texture draws aren't modulated.
     device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
     device->SetTexture(1, nullptr);
     device->SetRenderState(D3DRS_ZENABLE, FALSE);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+}
+
+int CRendererD3D::CreateStaticMesh(const float* verts, int floatsPerVert, int vc,
+                                   const unsigned short* idx, int ic) {
+    if (!device || vc <= 0 || ic <= 0 || (floatsPerVert != 5 && floatsPerVert != 7)) return -1;
+    const DWORD fvf = floatsPerVert == 7 ? (D3DFVF_XYZ | D3DFVF_TEX2) : (D3DFVF_XYZ | D3DFVF_TEX1);
+    const UINT vbBytes = (UINT)(vc * floatsPerVert * sizeof(float)), ibBytes = (UINT)(ic * sizeof(unsigned short));
+    StaticMesh sm; sm.vertCount = vc; sm.floats = floatsPerVert;
+    // MANAGED: survives device resets (ResetDevice) without re-uploading.
+    if (FAILED(device->CreateVertexBuffer(vbBytes, D3DUSAGE_WRITEONLY, fvf, D3DPOOL_MANAGED, &sm.vb, nullptr))) return -1;
+    if (FAILED(device->CreateIndexBuffer(ibBytes, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &sm.ib, nullptr))) {
+        sm.vb->Release(); return -1;
+    }
+    void* p = nullptr;
+    if (SUCCEEDED(sm.vb->Lock(0, vbBytes, &p, 0))) { std::memcpy(p, verts, vbBytes); sm.vb->Unlock(); }
+    if (SUCCEEDED(sm.ib->Lock(0, ibBytes, &p, 0))) { std::memcpy(p, idx, ibBytes); sm.ib->Unlock(); }
+    staticMeshes.push_back(sm);
+    return (int)staticMeshes.size() - 1;
+}
+
+void CRendererD3D::DrawStaticMesh(int mesh, int firstIndex, int triCount, int tex, int lmTex,
+                                  const float* world16, uint32_t flags) {
+    if (!device || mesh < 0 || mesh >= (int)staticMeshes.size() || triCount <= 0) return;
+    const StaticMesh& sm = staticMeshes[mesh];
+    if (!sm.vb || !sm.ib) return;
+    const bool lm = sm.floats == 7 && lmTex >= 0 && lmTex < (int)textures.size() && tex >= 0 && tex < (int)textures.size();
+    if (lm) BeginLightmapStates(tex, lmTex, world16, flags);
+    else    BeginMeshStates(tex, world16, flags);
+    // A 7-float mesh drawn without its lightmap: same buffer, the first UV set only.
+    device->SetFVF(sm.floats == 7 ? (D3DFVF_XYZ | D3DFVF_TEX2) : (D3DFVF_XYZ | D3DFVF_TEX1));
+    device->SetStreamSource(0, sm.vb, 0, (UINT)(sm.floats * sizeof(float)));
+    device->SetIndices(sm.ib);
+    device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, (UINT)sm.vertCount, (UINT)firstIndex, (UINT)triCount);
+    device->SetStreamSource(0, nullptr, 0, 0);
+    device->SetIndices(nullptr);
+    if (lm) EndLightmapStates();
+    else    EndMeshStates();
+}
+
+void CRendererD3D::ReleaseStaticMesh(int mesh) {
+    if (mesh < 0 || mesh >= (int)staticMeshes.size()) return;
+    StaticMesh& sm = staticMeshes[mesh];
+    if (sm.vb) { sm.vb->Release(); sm.vb = nullptr; }
+    if (sm.ib) { sm.ib->Release(); sm.ib = nullptr; }
+}
+
+void CRendererD3D::ReleaseStaticMeshes() {
+    for (StaticMesh& sm : staticMeshes) { if (sm.vb) sm.vb->Release(); if (sm.ib) sm.ib->Release(); }
+    staticMeshes.clear();
 }
 
 void CRendererD3D::SetViewport(int x, int y, int w, int h) {
@@ -648,8 +770,9 @@ void CRendererD3D::ClearViewport(uint32_t argb) {
 
 void CRendererD3D::Shutdown()
 {
+    ReleaseStaticMeshes();
     for (auto* t : textures) if (t) t->Release();
-    textures.clear(); texIndex.clear();
+    textures.clear(); texIndex.clear(); texKey.clear(); texLastUse.clear();
     if (device) { device->Release(); device = nullptr; }
     if (d3d)    { d3d->Release();    d3d    = nullptr; }
 }
@@ -709,8 +832,8 @@ int CRendererD3D::ResolveAndLoad(const std::string& name) {
                 }
             }
         };
-        scan("resources/resources/xui/image");
-        scan(kTexRoot);
+        scan(RESC("resources/resources/xui/image"));
+        scan(RESC("resources/resources"));
     }
     EnsureD3DX();
     if (!g_createTex) return -1;
@@ -784,7 +907,72 @@ int CRendererD3D::LoadTexture(const char* name) {
     int idx = ResolveAndLoad(key);
     DbgLog("[tex] load '%s' -> %d", key.c_str(), idx);
     texIndex.emplace(key, idx);
+    if (idx >= 0) {
+        if (texKey.size() < textures.size()) { texKey.resize(textures.size()); texLastUse.resize(textures.size(), 0); texBytes.resize(textures.size(), 0); }
+        texKey[idx] = key; texLastUse[idx] = GetTickCount();
+        texBytes[idx] = TexMemory(textures[idx], texInfo);
+        reslog::Loaded(reslog::TEX, key, texBytes[idx], texInfo);
+    }
     return idx;
+}
+
+// Bytes of every mip level in its own format (what D3D keeps for it; the
+// managed pool holds this in system memory too).
+size_t CRendererD3D::TexMemory(IDirect3DTexture9* t, char* info) {
+    size_t total = 0;
+    D3DSURFACE_DESC d = {};
+    const DWORD levels = t ? t->GetLevelCount() : 0;
+    for (DWORD l = 0; l < levels; ++l) {
+        if (FAILED(t->GetLevelDesc(l, &d))) break;
+        const size_t px = (size_t)d.Width * d.Height;
+        switch (d.Format) {
+        case D3DFMT_DXT1: total += (std::max)(size_t(8), px / 2); break;
+        case D3DFMT_DXT2: case D3DFMT_DXT3: case D3DFMT_DXT4: case D3DFMT_DXT5: total += (std::max)(size_t(16), px); break;
+        case D3DFMT_A8: case D3DFMT_L8: case D3DFMT_P8: total += px; break;
+        case D3DFMT_R5G6B5: case D3DFMT_A1R5G5B5: case D3DFMT_A4R4G4B4: case D3DFMT_X1R5G5B5: case D3DFMT_A8L8: total += px * 2; break;
+        default: total += px * 4; break;
+        }
+    }
+    if (info && t && SUCCEEDED(t->GetLevelDesc(0, &d))) {
+        const char* f = d.Format == D3DFMT_DXT1 ? "DXT1" : d.Format == D3DFMT_DXT3 ? "DXT3" : d.Format == D3DFMT_DXT5 ? "DXT5" :
+                        d.Format == D3DFMT_A8R8G8B8 ? "A8R8G8B8" : d.Format == D3DFMT_X8R8G8B8 ? "X8R8G8B8" : "other";
+        snprintf(info, 64, "(%ux%u %s, %lu mips)", d.Width, d.Height, f, (unsigned long)levels);
+    }
+    return total;
+}
+
+// A slot's texture, loaded again by its name if TrimTextures released it -
+// handles held by the UI, the maps and the models stay valid.
+IDirect3DTexture9* CRendererD3D::Tex(int i) {
+    if (i < 0 || i >= (int)textures.size()) return nullptr;
+    if (i < (int)texLastUse.size()) texLastUse[i] = GetTickCount();
+    if (!textures[i] && i < (int)texKey.size() && !texKey[i].empty()) {
+        const int n = ResolveAndLoad(texKey[i]);
+        if (n >= 0) {
+            textures[i] = textures[n]; texSize[i] = texSize[n];
+            textures.pop_back(); texSize.pop_back();
+            DbgLog("[tex] reload '%s' -> %d", texKey[i].c_str(), i);
+            if (i < (int)texBytes.size()) { texBytes[i] = TexMemory(textures[i], texInfo); reslog::Loaded(reslog::TEX, texKey[i], texBytes[i], "(reloaded)"); }
+        }
+    }
+    return textures[i];
+}
+
+void CRendererD3D::TrimTextures(unsigned unusedMs) {
+    const DWORD now = GetTickCount();
+    int freed = 0; double mb = 0.0;
+    for (size_t i = 0; i < textures.size() && i < texLastUse.size(); ++i) {
+        if (!textures[i] || texKey[i].empty() || now - texLastUse[i] < unusedMs) continue;
+        mb += texSize[i].first * (double)texSize[i].second * 4.0 * 1.33 / (1024.0 * 1024.0);
+        textures[i]->Release(); textures[i] = nullptr; ++freed;
+        if (i < texBytes.size()) reslog::Released(reslog::TEX, texKey[i], texBytes[i], "(not drawn for a while)");
+    }
+    if (freed) DbgLog("[tex] trimmed %d textures unused for %us (~%.0f MB)", freed, unusedMs / 1000, mb);
+    int live = 0; double liveMb = 0.0;
+    for (size_t i = 0; i < textures.size(); ++i) if (textures[i]) {
+        ++live; liveMb += texSize[i].first * (double)texSize[i].second * 4.0 * 1.33 / (1024.0 * 1024.0);
+    }
+    DbgLog("[tex] live %d textures, ~%.0f MB at 32 bpp (DXT files are 4-8x smaller); %zu slots", live, liveMb, textures.size());
 }
 
 void CRendererD3D::DrawImage(int x, int y, int w, int h, int tex,
@@ -812,7 +1000,7 @@ void CRendererD3D::DrawImage(int x, int y, int w, int h, int tex,
     device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
     device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-    device->SetTexture(0, textures[tex]);
+    device->SetTexture(0, Tex(tex));
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
     device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(TLT));
 }

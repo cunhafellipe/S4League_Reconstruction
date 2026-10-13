@@ -9,6 +9,8 @@
 struct IDirect3D9;
 struct IDirect3DDevice9;
 struct IDirect3DTexture9;
+struct IDirect3DVertexBuffer9;
+struct IDirect3DIndexBuffer9;
 struct ID3DXFont;
 
 // Config fields (hwnd/width/height/fullscreen/vsync/...) are inherited from
@@ -22,6 +24,9 @@ struct CRendererD3D : IRenderer {
     bool CanRender()  override;   // render gate (device present + not lost)
     void BeginFrame() override;   // Clear + BeginScene
     void Present()    override;   // EndScene + Present
+    void RequestScreenshot() override { screenshotPending = true; }
+    bool screenshotPending = false;
+    void SaveScreenshot();
     void Shutdown()   override;
     void DrawRect(int x, int y, int w, int h, uint32_t argb) override;
     int  LoadTexture(const char* name) override;
@@ -48,8 +53,24 @@ struct CRendererD3D : IRenderer {
     void ClearViewport(uint32_t argb) override;
     void DrawParticles(const float* particles, int count, int tex, bool additive, int renderType, const float* uv = nullptr) override;
     void DrawBeam(const float* pts, int count, float width, uint32_t argb, int tex, bool additive, float u0, float u1) override;
+    int  CreateStaticMesh(const float* verts, int floatsPerVert, int vertCount,
+                          const unsigned short* idx, int idxCount) override;
+    void DrawStaticMesh(int mesh, int firstIndex, int triCount, int tex, int lmTex,
+                        const float* world16, uint32_t flags = 0) override;
+    void ReleaseStaticMeshes() override;
+    void ReleaseStaticMesh(int mesh) override;
+    void SetMeshCapture(std::vector<CapturedMesh>* sink) override { meshCapture = sink; }
+    std::vector<CapturedMesh>* meshCapture = nullptr;
 
 private:
+    struct StaticMesh { IDirect3DVertexBuffer9* vb = nullptr; IDirect3DIndexBuffer9* ib = nullptr; int vertCount = 0, floats = 5; };
+    std::vector<StaticMesh> staticMeshes;
+    // Shared by the per-frame and static paths: render/texture states for a
+    // single-texture mesh, and for main texture x lightmap.
+    void BeginMeshStates(int tex, const float* world16, uint32_t flags);
+    void EndMeshStates();
+    void BeginLightmapStates(int tex, int lmTex, const float* world16, uint32_t flags);
+    void EndLightmapStates();
     float camEye[3] = {0,0,0}, camAt[3] = {0,0,1};   // cached from the last SetCamera3D, for particle billboards
     std::vector<IDirect3DTexture9*> textures;
     std::vector<std::pair<int,int>> texSize;   // native w,h per texture
@@ -57,6 +78,15 @@ private:
     std::unordered_map<std::string, std::string> fileIndex;  // filename -> full path
     bool fileIndexBuilt = false;
     int  ResolveAndLoad(const std::string& name);
+    std::vector<std::string> texKey;     // slot -> the name it was loaded by (for reloading)
+    std::vector<DWORD> texLastUse;       // slot -> GetTickCount of its last draw
+    IDirect3DTexture9* Tex(int i);
+    std::vector<size_t> texBytes;        // slot -> memory of its levels
+    char texInfo[64] = {};
+    static size_t TexMemory(IDirect3DTexture9* t, char* info);
+public:
+    void TrimTextures(unsigned unusedMs) override;
+private:
 
     std::unordered_map<int, ID3DXFont*> fonts;       // pixel size -> font
     std::string fontFamily;                          // 2002.ttf family name

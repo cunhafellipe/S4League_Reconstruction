@@ -4,6 +4,8 @@
     ],
     "online": { "enabled": false, "server": "127.0.0.1", "port": 4100, "nickname": "player" },
     "resource_mode": "normal",
+    "music_enabled": false,
+    "music_track": "",
     "graphics_quality": "high",
     "resolution": "1600x900",
     "display": "windowed",

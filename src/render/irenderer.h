@@ -6,6 +6,7 @@
 #pragma once
 #include <windows.h>
 #include <cstdint>
+#include <vector>
 
 struct IRenderer {
     // Config (filled by WinMain before Init). Mirrors CRenderer_D3D fields.
@@ -27,6 +28,11 @@ struct IRenderer {
     // (a D3D9 device can't be Reset between BeginScene and EndScene).
     virtual void RequestResize(int w, int h) { (void)w; (void)h; }
     virtual void RequestQuality(int q) { quality = q; }
+    // PrtScr: the next presented frame is saved as screenshots/<date_time>.png.
+    virtual void RequestScreenshot() {}
+    // Releases textures not drawn for unusedMs; they load again by name when
+    // next drawn (their handles stay valid).
+    virtual void TrimTextures(unsigned unusedMs) { (void)unusedMs; }
     virtual bool Init()       = 0;
     virtual bool CanRender()  = 0;
     virtual void BeginFrame() = 0;   // clear + begin scene
@@ -81,6 +87,31 @@ struct IRenderer {
                                   int tex, int lmTex, const float* world16, uint32_t flags = 0) {
         (void)posUV2;(void)vertCount;(void)idx;(void)idxCount;(void)tex;(void)lmTex;(void)world16;(void)flags;
     }
+    // Static geometry (map meshes): uploaded ONCE to GPU buffers, then drawn by
+    // handle - the client keeps map geometry in vertex/index buffers instead of
+    // re-sending every vertex each frame. floatsPerVert: 5 = xyz uv, 7 = xyz uv uv2.
+    virtual int  CreateStaticMesh(const float* verts, int floatsPerVert, int vertCount,
+                                  const unsigned short* idx, int idxCount) {
+        (void)verts;(void)floatsPerVert;(void)vertCount;(void)idx;(void)idxCount; return -1;
+    }
+    // Draws triCount triangles from firstIndex. lmTex >= 0 (and a 7-float mesh):
+    // main texture x lightmap, as DrawMeshLightmap; else as DrawMesh.
+    virtual void DrawStaticMesh(int mesh, int firstIndex, int triCount, int tex, int lmTex,
+                                const float* world16, uint32_t flags = 0) {
+        (void)mesh;(void)firstIndex;(void)triCount;(void)tex;(void)lmTex;(void)world16;(void)flags;
+    }
+    virtual void ReleaseStaticMeshes() {}
+    // Frees one static mesh (its slot stays; drawing it then does nothing).
+    virtual void ReleaseStaticMesh(int mesh) { (void)mesh; }
+    // While a sink is set, DrawMesh stores the call (vertices, indices, texture,
+    // world matrix, flags) instead of drawing it: a pose drawn once can be
+    // turned into static meshes and replayed from the GPU.
+    struct CapturedMesh {
+        std::vector<float> verts; int vertCount = 0;
+        std::vector<unsigned short> idx;
+        int tex = -1; float world[16] = {}; uint32_t flags = 0;
+    };
+    virtual void SetMeshCapture(std::vector<CapturedMesh>* sink) { (void)sink; }
     // Restrict 3D rendering to a screen rect (character preview panel). (0,0,0,0)
     // = full backbuffer. Also sets the perspective aspect for SetCamera3D.
     virtual void SetViewport(int x, int y, int w, int h) { (void)x;(void)y;(void)w;(void)h; }

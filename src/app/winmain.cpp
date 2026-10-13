@@ -22,6 +22,8 @@
 #include "input/input.h"
 #include "net/config.h"
 #include "app/dbg.h"
+#include "app/crash.h"
+#include "app/respath.h"
 #include "app/focus.h"
 #include "audio/audio.h"
 #include <string>
@@ -278,6 +280,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                               DbgLog("[fps] cap -> %d", g_targetFps);
                           }
                           return 0;
+    // PrtScr: Windows sends only its key-up (no WM_KEYDOWN).
+    case WM_KEYUP:
+    case WM_SYSKEYUP:     if (wp == VK_SNAPSHOT && g_host && g_host->engine && g_host->engine->renderer) {
+                              g_host->engine->renderer->RequestScreenshot();
+                              return 0;
+                          }
+                          break;
     case WM_MOUSEWHEEL:   if (GameHasFocus()) input::g.wheel += GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA; return 0;
     case WM_LBUTTONDOWN:  input::g.click = true; input::g.down = true;
                           input::g.mx = LOWORD(lp); input::g.my = HIWORD(lp); return 0;
@@ -346,6 +355,8 @@ static void SaveUserData() {}                 // FUN_0164a000 + FUN_01648ce0
 // FUN_00f163d0 : WinMain(hInst, hPrevInstance, lpCmdLine, nCmdShow)
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int nCmdShow)
 {
+    crash::Install();
+    respath::InitFromConfig();   // resource root: normal = resources, full = the extended tree
     if (!InitInstance())
         return 0;
 

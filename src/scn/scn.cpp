@@ -1,5 +1,6 @@
 // .scn parser, ported 1:1 from C:\S4Web2\engine\scn_geometry.js.
 #include "scn/scn.h"
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <fstream>
@@ -69,11 +70,14 @@ static std::vector<Anim> ReadModelAnims(Reader& r) {
             ReadTransformKeys(r, a.trans, a.rot, a.scale);
         }
         ReadVis(r, a.vis);
-        uint32_t mc = r.U32();   // morph keys (unused)
+        uint32_t mc = r.U32();   // morph (vertex animation) keys
         for (uint32_t j = 0; j < mc && !r.bad; ++j) {
-            r.U32();
-            uint32_t vc = r.U32(); for (uint32_t v = 0; v < vc && !r.bad; ++v) r.Skip(16);
-            uint32_t uc = r.U32(); for (uint32_t v = 0; v < uc && !r.bad; ++v) r.Skip(12);
+            MorphKey mk; mk.t = r.U32();
+            uint32_t vc = r.U32();
+            for (uint32_t v = 0; v < vc && !r.bad; ++v) { MorphVert mv; mv.idx = r.U32(); r.V3(mv.p); if (vc < 65536) mk.verts.push_back(mv); }
+            uint32_t uc = r.U32();
+            for (uint32_t v = 0; v < uc && !r.bad; ++v) { MorphUv mu; mu.idx = r.U32(); mu.u = r.F32(); mu.v = r.F32(); if (uc < 65536) mk.uvs.push_back(mu); }
+            if (mc < 4096) a.morph.push_back(std::move(mk));
         }
         anims.push_back(std::move(a));
     }
@@ -314,7 +318,16 @@ Scene ParseScn(const uint8_t* data, size_t size) {
         } else if (type == LIGHT_MAGIC) {
             r.Skip(2*4 + 7*3*4);
         } else if (type == LINE_MAGIC) {
-            uint32_t c = r.U32(); r.Skip(size_t(c) * 2 * 3 * 4);
+            // CShapeNode line (weapon "Line01" under the blade): the segment a
+            // CGhostTrailNode sweeps for the sword trail (Game::CActor::
+            // MakeGhostTrailNode looks it up by name).
+            Line ln; ln.name = base.name; ln.parent = base.parent;
+            std::memcpy(ln.matrix, base.matrix, sizeof(ln.matrix));
+            uint32_t c = r.U32();
+            if (c > 4096) c = 0;
+            ln.pts.resize(size_t(c) * 6);
+            for (float& f : ln.pts) f = r.F32();
+            sc.lines.push_back(std::move(ln));
         } else if (type == SPHERE_MAGIC) {
             r.Skip(4 + 3 * 4 + 4);
         }
@@ -352,6 +365,26 @@ Scene Parse(const char* path) {
     std::string p = path;
     size_t s = p.find_last_of("/\\");
     sc.dir = (s == std::string::npos) ? "" : p.substr(0, s);
+    // Memory it takes: geometry (kept twice: flat arrays + Vec3/Face views),
+    // skins and animation keys.
+    size_t geo = 0, dup = 0, anim = 0;
+    auto animBytes = [](const Anim& a) {
+        size_t b = a.trans.capacity() * sizeof(VecKey) + a.scale.capacity() * sizeof(VecKey) +
+                   a.rot.capacity() * sizeof(QuatKey) + a.vis.capacity() * sizeof(VisKey) + sizeof(Anim);
+        for (const MorphKey& k : a.morph) b += sizeof(MorphKey) + k.verts.capacity() * sizeof(MorphVert) + k.uvs.capacity() * sizeof(MorphUv);
+        return b;
+    };
+    for (const Model& m : sc.models) {
+        geo += m.positions.capacity() * sizeof(float) + m.indices.capacity() * sizeof(uint16_t) + m.uvs.capacity() * sizeof(float);
+        dup += m.vertices.capacity() * sizeof(Vec3) + m.faces.capacity() * sizeof(Face) + m.uv1.capacity() * sizeof(Vec2) + m.uv2.capacity() * sizeof(Vec2);
+        for (const SkinBone& sb : m.skin) geo += sizeof(SkinBone) + sb.weights.capacity() * sizeof(BoneWeight);
+        for (const Anim& a : m.anims) anim += animBytes(a);
+    }
+    for (const Bone& b : sc.bones) for (const Anim& a : b.anims) anim += animBytes(a);
+    char note[160];
+    snprintf(note, sizeof(note), "(geometry %.2f MB + its second copy %.2f MB, animation %.2f MB, file %.2f MB)",
+             geo / 1048576.0, dup / 1048576.0, anim / 1048576.0, buf.size() / 1048576.0);
+    if (sc.ok) sc.memTag.Set(reslog::SCN, path, geo + dup + anim, note);
     return sc;
 }
 

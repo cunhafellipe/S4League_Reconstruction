@@ -108,6 +108,80 @@ float ModelVisibility(const Model& m, const std::string& clipName, uint32_t tick
     return k.back().v;
 }
 
+bool SampleMorphPositions(const Model& m, const std::string& clipName, uint32_t tick, bool loop, std::vector<Vec3>& out) {
+    const Anim* a = nullptr;
+    for (const Anim& x : m.anims) if (x.name == clipName && !x.morph.empty()) { a = &x; break; }
+    if (!a) for (const Anim& x : m.anims) if (!x.morph.empty()) { a = &x; break; }
+    if (!a || m.vertices.empty()) return false;
+    const uint32_t t = loop && a->duration ? (tick % a->duration) : tick;
+    out = m.vertices;
+    const size_t nv = m.vertices.size();
+    // Per vertex: last key at or before t naming it, and the next one after t.
+    std::vector<int> prevK(nv, -1), nextK(nv, -1);
+    std::vector<int> prevI(nv, -1), nextI(nv, -1);
+    for (size_t k = 0; k < a->morph.size(); ++k) {
+        const MorphKey& mk = a->morph[k];
+        for (size_t i = 0; i < mk.verts.size(); ++i) {
+            const uint32_t v = mk.verts[i].idx; if (v >= nv) continue;
+            if (mk.t <= t) { prevK[v] = (int)k; prevI[v] = (int)i; }
+            else if (nextK[v] < 0) { nextK[v] = (int)k; nextI[v] = (int)i; }
+        }
+    }
+    for (size_t v = 0; v < nv; ++v) {
+        if (prevK[v] < 0 && nextK[v] < 0) continue;
+        float p0[3] = { m.vertices[v].x, m.vertices[v].y, m.vertices[v].z };
+        float t0 = 0.f;
+        if (prevK[v] >= 0) {
+            const MorphVert& mv = a->morph[prevK[v]].verts[prevI[v]];
+            p0[0] = mv.p[0]; p0[1] = mv.p[1]; p0[2] = mv.p[2]; t0 = (float)a->morph[prevK[v]].t;
+        }
+        float res[3] = { p0[0], p0[1], p0[2] };
+        if (nextK[v] >= 0) {
+            const MorphVert& mv = a->morph[nextK[v]].verts[nextI[v]];
+            const float t1 = (float)a->morph[nextK[v]].t, span = t1 - t0;
+            const float f = span > 0.f ? ((float)t - t0) / span : 1.f;
+            for (int k = 0; k < 3; ++k) res[k] = p0[k] + (mv.p[k] - p0[k]) * (f < 0.f ? 0.f : (f > 1.f ? 1.f : f));
+        }
+        out[v].x = res[0]; out[v].y = res[1]; out[v].z = res[2];
+    }
+    return true;
+}
+
+bool SampleMorphUvs(const Model& m, const std::string& clipName, uint32_t tick, bool loop, std::vector<Vec2>& out) {
+    const Anim* a = nullptr;
+    auto hasUv = [](const Anim& x) { for (const MorphKey& k : x.morph) if (!k.uvs.empty()) return true; return false; };
+    for (const Anim& x : m.anims) if (x.name == clipName && hasUv(x)) { a = &x; break; }
+    if (!a) for (const Anim& x : m.anims) if (hasUv(x)) { a = &x; break; }
+    if (!a || m.uv1.size() != m.vertices.size() || m.uv1.empty()) return false;
+    const uint32_t t = loop && a->duration ? (tick % a->duration) : tick;
+    out = m.uv1;
+    const size_t nv = m.uv1.size();
+    std::vector<int> prevK(nv, -1), nextK(nv, -1), prevI(nv, -1), nextI(nv, -1);
+    for (size_t k = 0; k < a->morph.size(); ++k) {
+        const MorphKey& mk = a->morph[k];
+        for (size_t i = 0; i < mk.uvs.size(); ++i) {
+            const uint32_t v = mk.uvs[i].idx; if (v >= nv) continue;
+            if (mk.t <= t) { prevK[v] = (int)k; prevI[v] = (int)i; }
+            else if (nextK[v] < 0) { nextK[v] = (int)k; nextI[v] = (int)i; }
+        }
+    }
+    for (size_t v = 0; v < nv; ++v) {
+        if (prevK[v] < 0 && nextK[v] < 0) continue;
+        float u0 = m.uv1[v].u, v0 = m.uv1[v].v, t0 = 0.f;
+        if (prevK[v] >= 0) { const MorphUv& mu = a->morph[prevK[v]].uvs[prevI[v]]; u0 = mu.u; v0 = mu.v; t0 = (float)a->morph[prevK[v]].t; }
+        float ru = u0, rv = v0;
+        if (nextK[v] >= 0) {
+            const MorphUv& mu = a->morph[nextK[v]].uvs[nextI[v]];
+            const float t1 = (float)a->morph[nextK[v]].t, span = t1 - t0;
+            float f = span > 0.f ? ((float)t - t0) / span : 1.f;
+            f = f < 0.f ? 0.f : (f > 1.f ? 1.f : f);
+            ru = u0 + (mu.u - u0) * f; rv = v0 + (mu.v - v0) * f;
+        }
+        out[v].u = ru; out[v].v = rv;
+    }
+    return true;
+}
+
 Mat4 SampleNode(const Model& m, uint32_t tick) {
     if (m.anims.empty() || !m.anims[0].hasTransform) return kIdentity;
     const Anim& a = m.anims[0];
@@ -241,7 +315,17 @@ std::vector<Mat4> ResolveBoneWorlds(const Scene& sc, const Pose& pose, const flo
         }
     }
     for (size_t i = 0; i < nb; ++i) {
-        const Pose& bonePose = (lowerPose && IsLowerBodyBone(sc.bones[i].name)) ? *lowerPose : pose;
+        // A dummy hung on a leg (Gun_Dummy, the holster on the left thigh) moves
+        // with the legs: its own track comes from the legs' clip, like its parent.
+        // Left on the upper (aim) clip it kept the bind orientation and the
+        // holstered gun pointed forward / back at the player instead of down.
+        bool lowerBone = IsLowerBodyBone(sc.bones[i].name);
+        if (!lowerBone && parent[i] >= 0 && sc.bones[i].name.find("Bip01") == std::string::npos) {
+            const std::string& pn = sc.bones[parent[i]].name;
+            for (const char* k : { "Thigh", "Calf", "Foot", "Toe" })
+                if (pn.find(k) != std::string::npos) { lowerBone = true; break; }
+        }
+        const Pose& bonePose = (lowerPose && lowerBone) ? *lowerPose : pose;
         std::optional<Mat4> l = SampleBonePose(sc.bones[i], bonePose);
         if (!l) {
             // No clip for this bone: bone.matrix is ABSOLUTE (not parent-relative).

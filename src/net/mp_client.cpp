@@ -297,6 +297,8 @@ void Client::HandleWs(const std::string& msg, unsigned nowMs) {
         chat_.push_back({ m.s("nickname"), m.s("text") });
     } else if (t == "hurt") {
         Hurt h; h.dmg = (float)m.n("dmg"); h.knock = (float)m.n("knock"); h.fromId = (int)m.n("fromId");
+        h.stunMs = (float)m.n("stunMs"); h.blowDist = (float)m.n("blowDist"); h.blowPower = (float)m.n("blowPower"); h.crit = m.n("crit") != 0;
+        h.pushMs = (float)m.n("pushMs");
         if (const JVal* f = m.get("from")) { h.fromX = (float)f->n("x"); h.fromY = (float)f->n("y"); h.fromZ = (float)f->n("z"); }
         hurts_.push_back(h);
     } else if (t == "kicked") {
@@ -357,8 +359,10 @@ void Client::SendShot(const Shot& s) {
            "\",\"e\":" + e + "}");
 }
 
-void Client::SendHit(int targetId, float dmg, float knock) {
-    WsSend("{\"t\":\"hit\",\"targetId\":" + std::to_string(targetId) + ",\"dmg\":" + Num(dmg) + ",\"knock\":" + Num(knock) + "}");
+void Client::SendHit(int targetId, float dmg, float knock, float stunMs, float blowDist, float blowPower, bool crit, float pushMs) {
+    WsSend("{\"t\":\"hit\",\"targetId\":" + std::to_string(targetId) + ",\"dmg\":" + Num(dmg) + ",\"knock\":" + Num(knock) +
+           ",\"stunMs\":" + Num(stunMs) + ",\"blowDist\":" + Num(blowDist) + ",\"blowPower\":" + Num(blowPower) +
+           ",\"crit\":" + (crit ? "1" : "0") + ",\"pushMs\":" + Num(pushMs) + "}");
 }
 
 }  // namespace mp

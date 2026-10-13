@@ -28,7 +28,12 @@ struct Peer {
 };
 
 struct ChatLine { std::string nickname, text; };
-struct Hurt { float dmg = 0, knock = 0, fromX = 0, fromY = 0, fromZ = 0; int fromId = 0; };
+struct Hurt {
+    float dmg = 0, knock = 0, fromX = 0, fromY = 0, fromZ = 0; int fromId = 0;
+    // From the attack's own conditions (AddStunCondition / AddBlowCondition /
+    // SetAlwaysCritical): how the target reacts.
+    float stunMs = 0, blowDist = 0, blowPower = 0, pushMs = 0; bool crit = false;   // knock = push speed
+};
 // One gun shot, as the shooter saw it: where it left, the effects of that
 // weapon's attribute, and where each bullet ended (k: 0 air, 1 wall, 2 player).
 struct Shot {
@@ -64,7 +69,7 @@ public:
     void SendEquip(const std::string& weapon, const std::string& weaponStates);
     void SendCostume(const std::string& equip);
     void SendChat(const std::string& text);
-    void SendHit(int targetId, float dmg, float knock);
+    void SendHit(int targetId, float dmg, float knock, float stunMs = 0.f, float blowDist = 0.f, float blowPower = 0.f, bool crit = false, float pushMs = 0.f);
     void SendShot(const Shot& s);
 
     std::map<int, Peer>& Peers() { return peers_; }

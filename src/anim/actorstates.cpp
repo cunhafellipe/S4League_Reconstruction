@@ -1,5 +1,7 @@
 // Ported 1:1 from C:\S4Web2\engine\scn_actorstates.js.
 #include "actorstates.h"
+#include "lua/lua_actor_states.h"
+#include "app/dbg.h"
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -10,6 +12,8 @@
 #include <sstream>
 
 namespace fs = std::filesystem;
+
+#include "lua/lua_script_scan.h"
 
 namespace anim {
 
@@ -33,6 +37,7 @@ static const std::regex kSetAnimRe(
 static const std::regex kSoundRe(
     R"re(Add(SoundBySex|Sound)\s*\(\s*"([^"]*)"\s*(?:,\s*"([^"]*)"\s*)?,\s*"([^"]*)"\s*,\s*(\d+)\s*,\s*(\d+))re");
 static const std::regex kSeqRe(R"re(AddSequence\s*\(\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(\d+))re");
+static const std::regex kGhostRe(R"re(AddGhostTrail\s*\(\s*"([^"]*)"\s*,\s*(\d+)\s*,\s*(\d+))re");
 static const std::regex kBlenderRe(R"(customAnimBlender\s*=\s*state\s*:\s*GetCustomAnimBlender\s*\(\s*(\d+)\s*\))");
 static const std::regex kBlendRe(
     R"re(customAnimBlender\s*:\s*Get(Walk|Jump|Fly)(Upper|Lower)AnimParam\s*\(\s*(LOWER_ANIM_\w+)?\s*\)\s*:\s*SetBlendingAnim\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(LOOP_\w+)\s*,\s*([A-Za-z_]\w*|[\d.]+)\s*,\s*(RESET_\w+)\s*\))re");
@@ -52,7 +57,7 @@ static float Scalar(const std::string& body, const std::string& token) {
     return std::regex_search(body, m, assignment) ? std::stof(m[1].str()) : 1.f;
 }
 
-ParsedActorStates ParseActorStates(const std::string& scriptDir) {
+ParsedActorStates ParseActorStatesRegex(const std::string& scriptDir) {
     ParsedActorStates out;
     std::error_code ec;
     if (!fs::exists(scriptDir, ec)) return out;
@@ -95,6 +100,11 @@ ParsedActorStates ParseActorStates(const std::string& scriptDir) {
                 ActorSeq q; q.index = std::stoi(m[1].str()); q.seq = m[2].str(); q.sound = m[3].str(); q.startMs = std::stoi(m[4].str());
                 fn.seqs.push_back(std::move(q));
             }
+            for (auto it = std::sregex_iterator(body.begin(), body.end(), kGhostRe); it != std::sregex_iterator(); ++it) {
+                auto& m = *it;
+                ActorGhostTrail g; g.name = m[1].str(); g.startMs = std::stoi(m[2].str()); g.endMs = std::stoi(m[3].str());
+                fn.ghosts.push_back(std::move(g));
+            }
             struct BlockStart { size_t at; int blender; };
             std::vector<BlockStart> blockStarts;
             for (auto it = std::sregex_iterator(body.begin(), body.end(), kBlenderRe); it != std::sregex_iterator(); ++it)
@@ -120,6 +130,13 @@ ParsedActorStates ParseActorStates(const std::string& scriptDir) {
     return out;
 }
 
+ParsedActorStates ParseActorStates(const std::string& scriptDir) {
+    ParsedActorStates native;
+    if (luaw::RunActorStates(scriptDir, native)) return native;
+    DbgLog("[lua-actor] native run failed: falling back to the regex reader");
+    return ParseActorStatesRegex(scriptDir);
+}
+
 std::string RunDir(float inX, float inZ) {
     bool f = inZ > 0.5f, b = inZ < -0.5f, l = inX < -0.5f, r = inX > 0.5f;
     if (f && l) return "LEFT_FRONT"; if (f && r) return "RIGHT_FRONT";
@@ -132,11 +149,47 @@ std::string RunDir(float inX, float inZ) {
 // (LOWER_ANIM_*). Clip "base" (lowercase, not a real BASE clip on the skeleton)
 // is the Lua's own sentinel (e.g. SubMachineGun Firing/Misfiring) meaning "no
 // clip of its own, keep the current pose" - not a real clip name, so it's dropped.
+// Sigma blade shape change (S10 InitSigmaBlade_ChangeWeapon): while the
+// weapon is transformed, every state plays its ANIMPARAMLIST_SHAPECHNAGE_*
+// row (the scripts' spelling) instead of the plain one, the idle its
+// ANIMPARAMLIST_CHANGE_NORMAL, and the weapon-change state its CHANGE_DISABLE
+// pair (revert) instead of CHANGE_ENABLE (transform).
+static bool g_shapeChange = false;
+void SetShapeChange(bool on) { g_shapeChange = on; }
+bool ShapeChange() { return g_shapeChange; }
+
+static bool IsShapeVariant(const std::string& l) {
+    return l.find("SHAPECHNAGE_") != std::string::npos || l.find("SHAPECHANGE_") != std::string::npos ||
+           l == "ANIMPARAMLIST_CHANGE_NORMAL";
+}
+
 static std::vector<ActorAnim> Upper(const ActorFunc* fn) {
-    std::vector<ActorAnim> out;
+    std::vector<ActorAnim> rows, out;
     if (!fn) return out;
     for (const ActorAnim& a : fn->anims)
-        if (a.label.rfind("ANIMPARAMLIST_", 0) == 0 && a.clip != "base") out.push_back(a);
+        if (a.label.rfind("ANIMPARAMLIST_", 0) == 0 && a.clip != "base") rows.push_back(a);
+    // The weapon-change state: its ENABLE pair, or the DISABLE pair while
+    // transformed, as NORMAL / DELAY.
+    bool change = false;
+    for (const ActorAnim& a : rows) if (a.label.find("CHANGE_ENABLE_") != std::string::npos) { change = true; break; }
+    if (change) {
+        const std::string pre = g_shapeChange ? "ANIMPARAMLIST_CHANGE_DISABLE_" : "ANIMPARAMLIST_CHANGE_ENABLE_";
+        for (const ActorAnim& a : rows)
+            if (a.label.rfind(pre, 0) == 0) { ActorAnim b = a; b.label = "ANIMPARAMLIST_" + a.label.substr(pre.size()); out.push_back(b); }
+        return out;
+    }
+    for (const ActorAnim& a : rows) {
+        if (IsShapeVariant(a.label)) continue;
+        const ActorAnim* use = &a;
+        if (g_shapeChange) {
+            const std::string rest = a.label.substr(14);   // after ANIMPARAMLIST_
+            for (const ActorAnim& v : rows)
+                if (v.label == "ANIMPARAMLIST_SHAPECHNAGE_" + rest || v.label == "ANIMPARAMLIST_SHAPECHANGE_" + rest ||
+                    (rest == "NORMAL" && v.label == "ANIMPARAMLIST_CHANGE_NORMAL")) { use = &v; break; }
+        }
+        ActorAnim b = *use; b.label = a.label;   // consumers keep reading NORMAL / DELAY / FIRST ...
+        out.push_back(b);
+    }
     return out;
 }
 // The leg walk entries (LOWER_ANIM_*) this same function defines for its own
@@ -183,6 +236,10 @@ static bool Match1(const std::string& s, const std::regex& re, std::string& out)
 
 AttackAttribMap ParseAttackAttribs(const std::string& scriptDir) {
     AttackAttribMap out;
+    {   // compiled (vanilla) script: run it instead of reading text
+        const std::string file = (fs::path(scriptDir) / "attackattribindexer.lua").string();
+        if (luaw::IsBytecodeFile(file) && luaw::ReadAttackAttribs(file, out)) return out;
+    }
     std::string text = ReadLua((fs::path(scriptDir) / "attackattribindexer.lua").string());
     if (text.empty()) return out;
 
@@ -257,6 +314,10 @@ WeaponAttribs ResolveWeaponAttribs(const AttackAttribMap& attribMap, const std::
 
 WeaponAttackMap ParseWeaponAttackMap(const std::string& scriptDir) {
     WeaponAttackMap out;
+    {
+        const std::string file = (fs::path(scriptDir) / "actorstates_gameplay.lua").string();
+        if (luaw::IsBytecodeFile(file) && luaw::ReadWeaponAttackMap(file, out)) return out;
+    }
     std::string text = ReadLua((fs::path(scriptDir) / "actorstates_gameplay.lua").string());
     if (text.empty()) return out;
 
@@ -282,14 +343,24 @@ WeaponAttackMap ParseWeaponAttackMap(const std::string& scriptDir) {
 static bool HasUpper(const ActorFunc* fn) { return !Upper(fn).empty(); }
 
 WeaponAnim ResolveWeaponAnim(const ParsedActorStates& parsed, const std::string& weapon,
-                              const WeaponAttackMap* attackMap, const AttackAttribMap* attribMap) {
+                              const WeaponAttackMap* attackMap, const AttackAttribMap* attribMap,
+                              const ItemLuaRows* rows) {
     WeaponAnim out;
+    // The item row's ani= function for a state, when the scripts have it.
+    auto rowFn = [&](const char* state) -> const ActorFunc* {
+        if (!rows) return nullptr;
+        auto it = rows->find(state);
+        return it == rows->end() || it->second.ani.empty() ? nullptr : Get(parsed, it->second.ani);
+    };
     const ActorFunc* norm = Get(parsed, "NormalState_" + weapon);
     const ActorFunc* run  = Get(parsed, "RunState_" + weapon);
     const ActorFunc* weak = Get(parsed, "SwordAtkWeakState_" + weapon);
     const ActorFunc* strong = Get(parsed, "SwordAtkStrongState_" + weapon);
     const ActorFunc* strong1 = nullptr; const ActorFunc* counter = nullptr; const ActorFunc* weapon2 = nullptr;
     std::vector<ActorAnim> comboRest;
+    std::vector<const ActorFunc*> comboRestFns;   // the function each comboRest row came from
+    if (const ActorFunc* f = rowFn("normal")) norm = f;
+    if (const ActorFunc* f = rowFn("run")) run = f;
 
     std::string type;
     if (attackMap) {
@@ -309,12 +380,38 @@ WeaponAnim ResolveWeaponAnim(const ParsedActorStates& parsed, const std::string&
                 if (const ActorFunc* f = findFn(*tbl)) {
                     std::vector<ActorAnim> u = Upper(f);
                     comboRest.insert(comboRest.end(), u.begin(), u.end());
+                    comboRestFns.insert(comboRestFns.end(), u.size(), f);
                 }
             }
         }
     }
     const ActorFunc* jatk = Get(parsed, "SwordJumpAtkState_" + weapon);
     const ActorFunc* jweak = Get(parsed, "SwordJumpAtkWeakState_" + weapon);
+
+    // The item's rows name the exact functions (skins: UseWeapon1State_
+    // SpyDagger_Mach3, SwordJumpAtkState_magmaBlade; the counter sword's
+    // AfterDash1..4 chain and its CounterAttack hold). left_strong1 is the
+    // held swing (SwordAtkStrongState), left_strong2 the second one
+    // (SwordAtkStrong1State), left_attack the click for guns and daggers.
+    if (rows) {
+        const ActorFunc* rWeak = rowFn("left_weak");
+        if (!rWeak) rWeak = rowFn("left_attack");
+        if (rWeak && HasUpper(rWeak)) weak = rWeak;
+        if (const ActorFunc* f = rowFn("left_strong1")) if (HasUpper(f)) strong = f;
+        if (const ActorFunc* f = rowFn("left_strong2")) if (HasUpper(f)) strong1 = f;
+        if (const ActorFunc* f = rowFn("counter_attack")) counter = f;
+        if (const ActorFunc* f = rowFn("right_attack")) weapon2 = f;
+        if (const ActorFunc* f = rowFn("left_jump")) jatk = f;
+        std::vector<ActorAnim> rowCombo;
+        std::vector<const ActorFunc*> rowComboFns;
+        for (const char* st : { "left_attack2", "left_attack3", "left_attack4", "left_attack5" })
+            if (const ActorFunc* f = rowFn(st)) {
+                std::vector<ActorAnim> u = Upper(f);
+                rowCombo.insert(rowCombo.end(), u.begin(), u.end());
+                rowComboFns.insert(rowComboFns.end(), u.size(), f);
+            }
+        if (!rowCombo.empty()) { comboRest = rowCombo; comboRestFns = rowComboFns; }
+    }
 
     for (const ActorAnim& a : Upper(run)) {
         if (a.label.find("UPPER_") == std::string::npos) continue;
@@ -344,6 +441,24 @@ WeaponAnim ResolveWeaponAnim(const ParsedActorStates& parsed, const std::string&
     static std::vector<ActorAnim> idleStore, strongStore, strong1Store, counterStore, jweakStore, reloadStore;
     idleStore = Upper(norm); out.idle = idleStore.empty() ? nullptr : &idleStore[0];
     out.atkWeak = Upper(weak); out.atkWeak.insert(out.atkWeak.end(), comboRest.begin(), comboRest.end());
+    {
+        std::vector<const ActorFunc*> fns(out.atkWeak.size() - comboRest.size(), weak);
+        fns.insert(fns.end(), comboRestFns.begin(), comboRestFns.end());
+        fns.resize(out.atkWeak.size(), weak);
+        // NORMAL/DELAY pairs are one hit each (its swing, then its recovery):
+        // the combo steps hit to hit, the DELAY row plays after the hit.
+        std::vector<ActorAnim> hits, delays;
+        std::vector<const ActorFunc*> hitFns;
+        for (size_t i = 0; i < out.atkWeak.size(); ++i) {
+            const ActorAnim& a = out.atkWeak[i];
+            if (a.label.find("DELAY") != std::string::npos) { if (!hits.empty() && delays.back().clip.empty()) delays.back() = a; continue; }
+            hits.push_back(a); delays.push_back(ActorAnim{}); hitFns.push_back(fns[i]);
+        }
+        if (!hits.empty()) { out.atkWeak = std::move(hits); out.atkWeakDelay = std::move(delays); out.fnWeakHits = std::move(hitFns); }
+        else { out.atkWeakDelay.assign(out.atkWeak.size(), ActorAnim{}); out.fnWeakHits = std::move(fns); }
+    }
+    out.fnStrong = strong; out.fnStrong1 = strong1; out.fnCounter = counter; out.fnWeapon2 = weapon2;
+    if (weapon2) for (const ActorAnim& a : weapon2->anims) if (a.label.find("CHANGE_ENABLE_") != std::string::npos) { out.weaponChange = true; break; }
     strongStore = Upper(strong); out.atkStrong = strongStore.empty() ? nullptr : &strongStore[0];
     strong1Store = Upper(strong1); out.atkStrong1 = strong1Store.empty() ? nullptr : &strong1Store[0];
     out.lowerWeak = Lower(weak); out.lowerStrong = Lower(strong); out.lowerStrong1 = Lower(strong1);
@@ -378,6 +493,15 @@ WeaponAnim ResolveWeaponAnim(const ParsedActorStates& parsed, const std::string&
     out.seqStrong = (strong && !strong->seqs.empty()) ? &strong->seqs[0] : nullptr;
     out.seqJumpAtk = (jatk && !jatk->seqs.empty()) ? &jatk->seqs[0] : nullptr;
     out.seqJumpAtkWeak = (jweak && !jweak->seqs.empty()) ? &jweak->seqs[0] : nullptr;
+    out.fnJump = jatk; out.fnJumpWeak = jweak;
+    auto ghostOf = [](const ActorFunc* f) -> const ActorGhostTrail* {
+        // An empty name ("", 50, 600) = no trail.
+        if (f) for (const ActorGhostTrail& g : f->ghosts) if (!g.name.empty()) return &g;
+        return nullptr;
+    };
+    out.ghostWeak = ghostOf(weak); out.ghostStrong = ghostOf(strong); out.ghostStrong1 = ghostOf(strong1);
+    out.ghostCounter = ghostOf(counter); out.ghostWeapon2 = ghostOf(weapon2);
+    out.ghostJumpAtk = ghostOf(jatk); out.ghostJumpAtkWeak = ghostOf(jweak);
     out.gunBlastSeq = at.gunBlastSeq; out.gunBlastSound = at.gunBlastSound; out.gunFireBone = at.gunFireBone;
     out.gunWallSeq = at.gunWallSeq; out.gunWallSound = at.gunWallSound; out.gunTracerSeq = at.gunTracerSeq;
     out.gunHitSeq = at.gunHitSeq; out.gunHitSound = at.gunHitSound;
@@ -458,9 +582,10 @@ std::unordered_map<int, BlendSlot> WeaponBlend(const ParsedActorStates& parsed, 
         if (b.blender < 0) continue;
         BlendSlot& slot = out[b.blender];
         if (b.kind == "Walk") (b.part == "Upper" ? slot.upper : slot.lower)[b.dir] = b;
-        // jumpUpper/jumpLower/flyUpper/flyLower not stored separately here (unused
-        // by WeaponFireBlend, which only reads .upper); kept out of BlendSlot to
-        // match the JS shape actually consumed downstream.
+        // GetJump*/GetFly*AnimParam: the aim blend while rising / falling,
+        // keyed "JUMP" / "FLY" next to the walking directions.
+        else if (b.kind == "Jump" || b.kind == "Fly")
+            (b.part == "Upper" ? slot.upper : slot.lower)[b.kind == "Jump" ? "JUMP" : "FLY"] = b;
     }
     return out;
 }

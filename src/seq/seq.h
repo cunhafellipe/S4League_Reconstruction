@@ -11,6 +11,7 @@
 // carry the structured emitter+keyframe+texture data SeqPlayer needs to render;
 // other classNames (CActNodeLoader, ...) are kept for the node count/debug only.
 #pragma once
+#include "app/reslog.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -92,6 +93,7 @@ struct Node {
 };
 
 struct Sequence {
+    reslog::Tag memTag;   // counted in "loaded resources.log"
     float    version = 0;
     std::string name;
     uint8_t  flag = 0;

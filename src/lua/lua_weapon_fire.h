@@ -30,7 +30,19 @@ struct WeaponAttack {
     AttackShape shape;
     std::vector<float> offsets;     // AddProjectileOffset x,y,z triples (shot pattern, cycles per shot)
     std::vector<float> push;        // AddPushCondition (ms, speed, accel) triples - CPush on whoever it hits
+    std::vector<float> blow;        // AddBlowCondition (dist, power) pairs: launch speed away (dist) and up (power)
+    std::vector<float> upperCut;    // AddUpperCutCondition (dist, power): the attacker rises with a landed hit
+    std::vector<float> stun;        // AddStunCondition (minMs, maxMs, minDist, maxDist) quads
+    bool  alwaysCritical = false;   // SetAlwaysCritical(true)
+    std::string successCondition;   // SetAttackSuccessCondition (CONDITION_ACTOR...)
+    int   dependOn = -1;            // DependOn(other): index in the attack list, -1 none
+    bool  shakeEnable = false, shakeWhenSuccess = false;   // SetCameraShakeEnable / WhenSuccess
+    std::vector<float> shakeF1, shakeF2;                    // SetCameraShakeSetFactor1 / 2 arguments
 };
+
+// WEAPON:GetRange() for the next RunWeaponFire calls: the item's own range
+// (_eu_weapon.x7 <ability range>, plasma 500). 0 = the shim's default.
+void SetWeaponRange(float range);
 
 // STATE:Set* fields the attack function sets on itself before ever touching
 // ATTACKS - these apply to the whole swing, not to one hitbox.
@@ -54,6 +66,9 @@ struct WeaponFireState {
     // (sub_1075BA0) applies it always.
     bool  useMoveBox = false;
     float hitStopA = 0.f, hitStopB = 0.f;
+    // STATE:EnableCameraShake(enable, whenSuccess, startMs) + SetCameraShakeFactor1/2
+    // (the plasma jump attack shakes 600 ms in, on landing).
+    std::vector<float> cameraShake, cameraShakeF1, cameraShakeF2;
     bool  stealthCancel = false;
     // STATE:AddSequence(index, file, sound, startTime, endTime): an effect
     // .seq plus its sound, started startTime ms into the attack and kept for

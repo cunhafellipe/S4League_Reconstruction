@@ -30,6 +30,27 @@ struct ActorSeq {
     int index = 0;
     std::string seq, sound;
     int startMs = 0;
+    std::string seqGirl;   // AddSequenceBySex: the female version (seq = male)
+    std::string kind;      // "" AddSequence, "bysex" AddSequenceBySex, "self" AddSequenceBySelf
+};
+// state:AddInstantEffect(node, seq, sound, start, range): an effect on a node
+// of the worn item (Iron Boots boosters).
+struct ActorInstantEffect {
+    std::string node, seq, sound;
+    int startMs = 0;
+};
+// state:AddGhostTrail("GhostTrail_<weapon>_NN", startMs, endMs): the weapon's
+// Line01 leaves a trail from startMs to endMs of the state (beta CActorState
+// binding; the trail itself is CWeapon's MakeGhostTrailNode on "Line01").
+struct ActorGhostTrail {
+    std::string name;
+    int startMs = 0, endMs = 0;
+};
+// GetAnimParam(i):SetAniNameForHuman(clip, alt, flag) - the Death Scythe's
+// per-sex clip swap (GR000 -> GR000_1).
+struct ActorHumanName {
+    std::string label, clip, alt;
+    bool flag = false;
 };
 struct ActorBlend {
     int blender = -1;
@@ -46,13 +67,26 @@ struct ActorFunc {
     std::vector<ActorAnim> anims;
     std::vector<ActorSound> sounds;
     std::vector<ActorSeq> seqs;
+    std::vector<ActorGhostTrail> ghosts;
     std::vector<ActorBlend> blend;
+    std::vector<ActorHumanName> human;
+    std::vector<ActorSound> transSounds;          // AddSoundTransBySex (transformed sigma)
+    std::vector<ActorInstantEffect> instant;      // AddInstantEffect
+    float ironBootsSpeedGhost = 1.f, ironBootsSpeedSelf = 1.f;   // SetAniPlaySpeed_IronBoots
 };
 
 using ParsedActorStates = std::unordered_map<std::string, ActorFunc>;
 
-// Parses every actorstates_*.lua in scriptDir into { funcName -> ActorFunc }.
+// Sigma shape change: while on, the resolvers below (ResolveWeaponAnim, the
+// controller's LoadFromLua) read every state's transformed rows.
+void SetShapeChange(bool on);
+bool ShapeChange();
+
+// Every actorstates_*.lua in scriptDir into { funcName -> ActorFunc }: the
+// scripts are RUN (luaw::RunActorStates, real Lua with the client's calls
+// recorded); the regex reader below is only the fallback if Lua cannot load.
 ParsedActorStates ParseActorStates(const std::string& scriptDir);
+ParsedActorStates ParseActorStatesRegex(const std::string& scriptDir);
 
 // Run direction from raw input (native LH, inZ>0=front) - same mapping as anim_controller's Gate(RUN).
 std::string RunDir(float inX, float inZ);
@@ -87,6 +121,16 @@ struct WeaponAnim {
     const ActorAnim* idle = nullptr;
     std::unordered_map<std::string, ActorAnim> run;              // dir -> param
     std::vector<ActorAnim> atkWeak;                               // full combo hit1..5
+    // Per combo hit: its DELAY row (counter sword AfterDash1..4: R0000 hit,
+    // R0025 recovery). Same size as atkWeak; empty clip = none (plasma's
+    // FIRST/SECOND/THIRD are hits only).
+    std::vector<ActorAnim> atkWeakDelay;
+    // The state function behind each attack (all its AddSequence / AddInstantEffect /
+    // AddGhostTrail): per combo hit, and per held / jump / right-click action.
+    std::vector<const ActorFunc*> fnWeakHits;
+    bool weaponChange = false;   // right click is a shape change (sigma blade: CHANGE_ENABLE / CHANGE_DISABLE)
+    const ActorFunc* fnStrong = nullptr; const ActorFunc* fnStrong1 = nullptr; const ActorFunc* fnCounter = nullptr;
+    const ActorFunc* fnWeapon2 = nullptr; const ActorFunc* fnJump = nullptr; const ActorFunc* fnJumpWeak = nullptr;
     const ActorAnim* atkStrong = nullptr;
     const ActorAnim* atkStrong1 = nullptr;
     // Legs keep playing their OWN walk/stand clip (keyed by direction, "NORMAL"
@@ -112,14 +156,26 @@ struct WeaponAnim {
     const ActorSound* sndWeak = nullptr; const ActorSound* sndStrong = nullptr;
     const ActorSeq* seqWeak = nullptr; const ActorSeq* seqStrong = nullptr;
     const ActorSeq* seqJumpAtk = nullptr; const ActorSeq* seqJumpAtkWeak = nullptr;
+    // state:AddGhostTrail per attack state (the blade trail and its window).
+    const ActorGhostTrail* ghostWeak = nullptr; const ActorGhostTrail* ghostStrong = nullptr;
+    const ActorGhostTrail* ghostStrong1 = nullptr; const ActorGhostTrail* ghostCounter = nullptr;
+    const ActorGhostTrail* ghostWeapon2 = nullptr;
+    const ActorGhostTrail* ghostJumpAtk = nullptr; const ActorGhostTrail* ghostJumpAtkWeak = nullptr;
     std::string gunBlastSeq, gunBlastSound, gunFireBone, gunWallSeq, gunWallSound, gunTracerSeq;
     std::string gunHitSeq, gunHitSound;   // SetDamageSequence args 1 and 3: a bullet on a player
 };
 // Owns the ActorFunc storage that WeaponAnim's pointers reference - keep this
 // alive as long as the returned WeaponAnim is used (same lifetime contract as
 // `parsed` in the JS: weaponAnim(parsed, ...) borrows from it).
+// The item's own weapon_lua.x7 rows: state ("left_weak", "left_strong1",
+// "left_jump", "right_attack", "left_attack2"...) -> the weapon_*.lua attack
+// function (weapon=) and the actorstates_*.lua function (ani=). When given,
+// they name every state's function; the type tables only fill what is missing.
+struct ItemLuaRow { std::string weapon, ani; };
+using ItemLuaRows = std::unordered_map<std::string, ItemLuaRow>;
 WeaponAnim ResolveWeaponAnim(const ParsedActorStates& parsed, const std::string& weapon,
-                              const WeaponAttackMap* attackMap, const AttackAttribMap* attribMap);
+                              const WeaponAttackMap* attackMap, const AttackAttribMap* attribMap,
+                              const ItemLuaRows* rows = nullptr);
 
 // dir -> RUN gate slot (same mapping as anim_controller's Gate(RUN)).
 extern const std::unordered_map<std::string, int> kRunSlot;
@@ -163,7 +219,14 @@ public:
     std::vector<std::string> Weapons(const char* prefix) const;
 
     const ParsedActorStates& parsed() const { return parsed_; }
+    const ActorFunc* Func(const std::string& name) const { auto it = parsed_.find(name); return it == parsed_.end() ? nullptr : &it->second; }
     const WeaponAttackMap& attackMap() const { return attackMap_; }
+    // A weapon suffix the dispatch tables do not list (ASSULT_RIFLE, HOMING_RIFLE,
+    // SPARK_RIFLE, TURRET, ...): register the WEAPONTYPE_* the item's own
+    // <ability type> gives, so its attacks, attribute and gun state resolve.
+    void AddTypeSuffix(const std::string& suffix, const std::string& typeName) {
+        if (!suffix.empty() && !typeName.empty() && !attackMap_.typeBySuffix.count(suffix)) attackMap_.typeBySuffix[suffix] = typeName;
+    }
     const AttackAttribMap& attribMap() const { return attribMap_; }
 
 private:

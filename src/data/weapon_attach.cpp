@@ -1,4 +1,5 @@
 // Ported 1:1 from C:\S4Web2\engine\weapon_attach.js.
+#include "lua/lua_script_scan.h"
 #include "weapon_attach.h"
 #include <filesystem>
 #include <fstream>
@@ -84,7 +85,16 @@ const std::unordered_map<std::string, int>& WeaponTypeIds(const std::string& res
     if (it != cache.end()) return it->second;
     auto& out = cache[resourcesPath];
 
-    std::ifstream f((fs::path(resourcesPath) / "resources" / "script" / "actorstates_constants.lua").string(), std::ios::binary);
+    const std::string constantsFile = (fs::path(resourcesPath) / "resources" / "script" / "actorstates_constants.lua").string();
+    if (luaw::IsBytecodeFile(constantsFile)) {
+        // Compiled script: run it; the WEAPONTYPE_ globals in value order are
+        // the same sequence the text reader numbers from -1.
+        int i = -1;
+        for (const auto& kv : luaw::ConstantsOf(constantsFile))
+            if (kv.first.rfind("WEAPONTYPE_", 0) == 0 || kv.first.rfind("WEAPONYTPE_", 0) == 0) out[kv.first] = i++;
+        return out;
+    }
+    std::ifstream f(constantsFile, std::ios::binary);
     if (!f) return out;
     std::ostringstream ss; ss << f.rdbuf();
     std::string text = ss.str();
@@ -117,6 +127,12 @@ std::optional<int> TypeFromSuffix(const std::string& resourcesPath, const std::s
         typeName = "WEAPONTYPE_3_SWORD";
     auto iit = ids.find(typeName);
     return iit != ids.end() ? std::optional<int>(iit->second) : std::nullopt;
+}
+
+std::string WeaponTypeName(const std::string& resourcesPath, int id) {
+    for (const auto& kv : WeaponTypeIds(resourcesPath))
+        if (kv.second == id && kv.first.rfind("WEAPONTYPE_", 0) == 0) return kv.first;   // skip the WEAPONYTPE_ typo duplicates
+    return "";
 }
 
 int AttachLink(const std::string& resourcesPath, int type, int sceneIndex) {

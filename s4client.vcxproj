@@ -40,10 +40,15 @@
       <SubSystem>Windows</SubSystem>
       <AdditionalDependencies>winmm.lib;xaudio2.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
+      <LargeAddressAware>true</LargeAddressAware>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\app\winmain.cpp" />
+    <ClCompile Include="src\app\crash.cpp" />
+    <ClCompile Include="src\app\respath.cpp" />
+    <ClCompile Include="src\app\reslog.cpp" />
     <ClCompile Include="src\audio\audio.cpp" />
     <ClCompile Include="src\render\renderer.cpp" />
     <ClCompile Include="src\newrender\renderer_d3d11.cpp" />
@@ -55,6 +60,9 @@
     <ClCompile Include="src\game\actor_input.cpp" />
     <ClCompile Include="src\game\actor_fsm.cpp" />
     <ClInclude Include="src\game\actor_input.h" />
+    <ClInclude Include="src\app\crash.h" />
+    <ClInclude Include="src\app\respath.h" />
+    <ClInclude Include="src\app\reslog.h" />
     <ClInclude Include="src\game\actor_fsm.h" />
     <ClInclude Include="src\anim\anim_controller.h" />
     <ClInclude Include="src\anim\anim_states.h" />
@@ -82,7 +90,11 @@
     <ClCompile Include="src\seq\seq_player.cpp" />
     <ClInclude Include="src\seq\seq_player.h" />
     <ClCompile Include="src\lua\lua_weapon_fire.cpp" />
+    <ClCompile Include="src\lua\lua_actor_states.cpp" />
+    <ClCompile Include="src\lua\lua_script_scan.cpp" />
     <ClInclude Include="src\lua\lua_weapon_fire.h" />
+    <ClInclude Include="src\lua\lua_actor_states.h" />
+    <ClInclude Include="src\lua\lua_script_scan.h" />
     <ClCompile Include="src\gui\xui.cpp" />
     <ClCompile Include="src\gui\gui_render.cpp" />
     <ClInclude Include="src\net\proud_crypt.h" />

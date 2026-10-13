@@ -125,7 +125,7 @@ ATTACKS = {}
 local Attack = {}
 Attack.__index = function(t, k) return rawget(Attack, k) or noop end
 local function newAttack(explosion)
-  return setmetatable({ explosion = explosion, blow = {}, push = {}, stun = {} }, Attack)
+  return setmetatable({ explosion = explosion, blow = {}, upperCut = {}, push = {}, stun = {} }, Attack)
 end
 function CreateCAttack() return newAttack(false) end
 function CreateCExplosionAttack() return newAttack(true) end
@@ -141,16 +141,22 @@ function Attack:SetCollisionRangeAdjust(a, b) self.collisionRangeAdjust = { a, b
 function Attack:SetConsumeAmmo(n) self.consumeAmmo = n end
 function Attack:SetGhostCalcCollisionRange(v) self.ghostCalcCollisionRange = v end
 function Attack:AddBlowCondition(dist, power) table.insert(self.blow, { dist, power }) end
+-- AddUpperCutCondition(dist, power): on a landed hit the ATTACKER goes up with
+-- its target (S10 CUpperCutCondition -> STATE_UPPERCUT, speed (dir*dist, power)).
+function Attack:AddUpperCutCondition(dist, power) table.insert(self.upperCut, { dist, power }) end
 function Attack:AddPushCondition(t, speed, cond) table.insert(self.push, { t, speed, cond }) end
 function Attack:AddStunCondition(minT, maxT, minD, maxD) table.insert(self.stun, { minT, maxT, minD, maxD }) end
 function Attack:SetAlwaysCritical(v) self.alwaysCritical = v end
 function Attack:SetAttackSuccessCondition(v) self.attackSuccessCondition = v end
 function Attack:SetCritical(mult, chance) self.critMult = mult; self.critChance = chance end
-function Attack:SetCameraShakeEnable(...) end
-function Attack:SetCameraShakeSetFactor1(...) end
-function Attack:SetCameraShakeSetFactor2(...) end
+function Attack:SetCameraShakeEnable(...) self.shakeEnable = { ... } end
+function Attack:SetCameraShakeSetFactor1(...) self.shakeF1 = { ... } end
+function Attack:SetCameraShakeSetFactor2(...) self.shakeF2 = { ... } end
 function Attack:SetCameraShakeRandomDir(...) end
-function Attack:SetCameraShakeWhenSuccess(...) end
+function Attack:SetCameraShakeWhenSuccess(v) self.shakeWhenSuccess = v end
+-- Attack1:DependOn(Attack2): Attack1 only counts where Attack2 lands (the
+-- plasma / counter sword critical ray inside their wide hit box).
+function Attack:DependOn(other) self.dependOn = other end
 function Attack:SetPlaySound(v) self.playSound = v end
 -- Shot pattern: one offset per shot, cycling (x, y, z with z = -1 forward).
 -- API_VERSION 1 scripts call AddProjectileOffset, 2 AddPatternPoint.
@@ -160,4 +166,4 @@ function Attack:AddProjectileOffset(x, y, z)
 end
 Attack.AddPatternPoint = Attack.AddProjectileOffset
 
-function AddAttack(list, atk) table.insert(list, atk) end
+function AddAttack(list, atk) table.insert(list, atk); atk.listIndex = #list end

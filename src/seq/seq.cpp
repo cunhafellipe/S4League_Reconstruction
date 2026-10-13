@@ -1,5 +1,6 @@
 #include "seq/seq.h"
 #include <fstream>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
@@ -192,7 +193,13 @@ static Sequence ParseUnchecked(const char* path);
 // game down with an uncaught exception (bad_alloc / out_of_range).
 Sequence Parse(const char* path) {
     try {
-        return ParseUnchecked(path);
+        Sequence sc = ParseUnchecked(path);
+        if (sc.ok) {
+            size_t b = sizeof(Sequence) + sc.nodes.capacity() * sizeof(Node);
+            if (FILE* f = fopen(path, "rb")) { fseek(f, 0, SEEK_END); b += (size_t)ftell(f); fclose(f); }
+            sc.memTag.Set(reslog::SEQ, path, b);
+        }
+        return sc;
     } catch (const std::exception& e) {
         Sequence sc; sc.error = std::string("unsupported layout: ") + e.what(); return sc;
     }
