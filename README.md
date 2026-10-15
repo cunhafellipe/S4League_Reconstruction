@@ -1,4 +1,18 @@
-# S4League Reconstruction
+
+# S4League Client Source Code Reconstruction
+
+An ongoing reverse engineering project focused on reconstructing the original S4 League game client source code in C++.
+
+## Project Goals
+- Reconstruct original client functionality
+- Analyze and document game client internals
+- Rebuild client systems from reverse engineering research
+- Document the original client architecture
+
+## Keywords
+S4League Source Code, S4 League Client Source,
+S4League Reverse Engineering, S4League Client Reconstruction
+
 
 Clean-room C++ reconstruction of an S4 League client, focused on reproducing the original runtime behavior from client data (Lua scripts, `.x7` tables, `.xui` layouts, `.scn` models, `.seq` effects) and reverse-engineering notes.
 
